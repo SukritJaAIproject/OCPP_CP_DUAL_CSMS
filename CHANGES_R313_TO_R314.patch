@@ -1,0 +1,378 @@
+--- R3.1.3/CP.py
++++ R3.1.4/CP.py
+@@ -1843,7 +1843,8 @@
+         if manager is None or not self.allow_rfid_command_start or not self._valid_id_tag(id_tag):
+             return False
+         gate = getattr(self, "_ocpp_start_allowed", None)
+-        if gate is not None and not await gate(cid, manager.config["local_csms"], id_tag):
++        # [R3.1.4] the CSMS that last accepted this tag (local_csms when unknown)
++        if gate is not None and not await gate(cid, manager.local_owner_for(id_tag), id_tag):
+             return False
+         if self._dual_connector_busy(cid) or not manager.claim_local(cid, id_tag):
+             logging.warning("[DUAL] RFID start rejected: connector %s is busy", cid)
+@@ -1900,8 +1901,9 @@
+ 
+     async def authorize(self, id_tag):
+         print(f"?? AUTHORIZE CALLED: {id_tag}")
+-        # Dual mode pins local authorization to local_csms. Record only Accepted
+-        # results so a timeout/rejection cannot be reused as successful auth.
++        # [R3.1.4] Dual mode asks local_csms first, then the other CSMS; the session
++        # belongs to the CSMS that accepted. Record only Accepted results so a
++        # timeout/rejection cannot be reused as successful auth.
+         if self._dual_manager is None:
+             self.auth_timestamps[id_tag] = time.time()
+ 
+--- R3.1.3/helpf/dual_csms.py
++++ R3.1.4/helpf/dual_csms.py
+@@ -318,6 +318,8 @@
+                 digest TEXT NOT NULL, response TEXT, created REAL NOT NULL,
+                 PRIMARY KEY(server, message_id));
+             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);
++            CREATE TABLE IF NOT EXISTS auth_owners (
++                tag TEXT PRIMARY KEY, owner TEXT NOT NULL, updated REAL NOT NULL);
+         """)
+         # A crash after sending Start but before persisting its response is
+         # indistinguishable from a lost response. It is never replayed.
+@@ -338,6 +340,7 @@
+         self._wake = {name: asyncio.Event() for name in self.servers}
+         self._status_wake = {name: asyncio.Event() for name in self.servers}
+         self._tasks = set()
++        self._local_claims = set()    # local_id of charger-side claims, owner fixed by Authorize
+         self._start_tasks = {}
+         self._running = False
+         self._db_closed = False
+@@ -428,8 +431,73 @@
+             # particular a local RFID event must not take over a pending
+             # RemoteStart from the default server, even with an identical tag.
+             return False
+-        self._reserve(connector, self.config["local_csms"], str(id_tag))
++        row = self._reserve(connector, self.local_owner_for(id_tag), str(id_tag))
++        self._local_claims.add(row["local_id"])
+         return True
++
++    # [R3.1.4] A charger-side idTag (RFID, MQTT RFID command, AutoCharge) is authorized
++    # by local_csms first and then by the other CSMS; the session belongs to the CSMS
++    # that accepted it. The mapping is kept as a hash of the tag, never the tag itself.
++    _AUTH_OWNER_LIMIT = 5000
++
++    @staticmethod
++    def _tag_key(id_tag):
++        return hashlib.sha256(("dual-csms-auth:%s" % id_tag).encode("utf-8")).hexdigest()
++
++    def local_owner_for(self, id_tag):
++        """CSMS that last accepted this idTag at the charger; local_csms when unknown."""
++        row = self.db.execute("SELECT owner FROM auth_owners WHERE tag=?", (self._tag_key(id_tag),)).fetchone()
++        if row is not None and row["owner"] in self.servers:
++            return row["owner"]
++        return self.config["local_csms"]
++
++    def _remember_auth_owner(self, id_tag, owner):
++        self.db.execute("INSERT INTO auth_owners(tag,owner,updated) VALUES (?,?,?) "
++                        "ON CONFLICT(tag) DO UPDATE SET owner=excluded.owner,updated=excluded.updated",
++                        (self._tag_key(id_tag), owner, time.time()))
++        self.db.execute("DELETE FROM auth_owners WHERE tag NOT IN "
++                        "(SELECT tag FROM auth_owners ORDER BY updated DESC LIMIT ?)", (self._AUTH_OWNER_LIMIT,))
++        # A local claim made before Authorize follows the CSMS that accepted the tag.
++        for local_id in list(self._local_claims):
++            row = self.db.execute("SELECT * FROM sessions WHERE local_id=?", (local_id,)).fetchone()
++            if row is None or row["state"] != "reserved":
++                self._local_claims.discard(local_id)
++            elif row["id_tag"] == str(id_tag) and row["owner"] != owner:
++                self.db.execute("UPDATE sessions SET owner=? WHERE local_id=?", (owner, local_id))
++                LOG.info("[DUAL] local start on connector %s now belongs to %s", row["connector"], owner)
++        self.db.commit()
++
++    def _authorize_order(self):
++        first = self.config["local_csms"]
++        return [first] + [name for name in self.servers if name != first]
++
++    async def _authorize(self, payload):
++        origin = command_origin()
++        if origin in self.servers:
++            # Authorize made while handling one CSMS's command stays with that CSMS.
++            return await self._request(origin, payload)
++        first_refusal = error = None
++        order = self._authorize_order()
++        for position, name in enumerate(order):
++            following = order[position + 1] if position + 1 < len(order) else None
++            try:
++                response = await self._request(name, payload)
++            except Exception as exc:     # not registered, timeout, transport error, CALLERROR
++                error = exc
++                LOG.warning("[%s] Authorize unavailable (%s)%s", name, type(exc).__name__,
++                            "; asking %s" % following if following else "")
++                continue
++            info = getattr(response, "id_tag_info", None)
++            status = _status(info.get("status") if isinstance(info, dict) else getattr(info, "status", None))
++            if status == "Accepted":
++                self._remember_auth_owner(payload.id_tag, name)
++                LOG.info("[%s] Authorize Accepted; the charger-side session belongs to %s", name, name)
++                return response
++            LOG.info("[%s] Authorize %s%s", name, status, "; asking %s" % following if following else "")
++            first_refusal = first_refusal or response
++        if first_refusal is not None:
++            return first_refusal
++        raise error if error is not None else BackendUnavailable("No CSMS answered Authorize")
+ 
+     def _reserve(self, connector, owner, id_tag):
+         cursor = self.db.execute(
+@@ -632,7 +700,7 @@
+                 event.set()
+             return call_result.StatusNotification()
+         if name == "Authorize":
+-            return await self._request(self.config["local_csms"], payload)
++            return await self._authorize(payload)
+         if name == "StartTransaction":
+             return await self._start_transaction(payload)
+         if name == "MeterValues":
+@@ -651,7 +719,7 @@
+             raise DualCSMSError("Unsupported connector")
+         row = self._live(connector)
+         if row is None:
+-            row = self._reserve(connector, self.config["local_csms"], str(payload.id_tag))
++            row = self._reserve(connector, self.local_owner_for(payload.id_tag), str(payload.id_tag))
+         if row["id_tag"] != str(payload.id_tag):
+             raise DualCSMSError("Start idTag differs from reserved physical session")
+         guard = getattr(self.core, "_ocpp_start_allowed", None)
+--- R3.1.3/tests/test_ocpp_manager_functions.py
++++ R3.1.4/tests/test_ocpp_manager_functions.py
+@@ -140,13 +140,16 @@
+ 
+ 
+ @pytest.mark.parametrize("status", ["Accepted", "Invalid", "Blocked", "Expired", "ConcurrentTx"])
+-async def test_local_authorize_preserves_server_decision_without_fallback_to_B(tmp_path, status):
++async def test_local_authorize_asks_B_only_when_A_does_not_accept(tmp_path, status):
++    # [R3.1.4] Until R3.1.3 the answer of A was final. Chosen 2026-11-09: A first, then B;
++    # the charger-side session belongs to the CSMS that accepted the tag.
+     async with FakeCSMS(auth_status=status) as a, FakeCSMS(auth_status="Accepted") as b:
+         async with running_manager(configuration(a, b), tmp_path) as (manager, _):
+             result = await manager.call(call.Authorize(id_tag="LOCAL-TEST"))
+-            assert result.id_tag_info["status"] == status
++            assert result.id_tag_info["status"] == "Accepted"
+             assert len(a.received("Authorize")) == 1
+-            assert not b.received("Authorize")
++            assert len(b.received("Authorize")) == (0 if status == "Accepted" else 1)
++            assert manager.local_owner_for("LOCAL-TEST") == ("A" if status == "Accepted" else "B")
+ 
+ 
+ @pytest.mark.parametrize("connector", [0, 3, -1])
+--- /dev/null
++++ R3.1.4/tests/test_r314_rfid_owner.py
+@@ -0,0 +1,217 @@
++"""R3.1.4: a charger-side idTag is authorized by A first, then by B (chosen 2026-11-09).
++
++The session belongs to the CSMS that accepted the tag, so StartTransaction, MeterValues
++and StopTransaction go there. The tag itself is never logged or stored by this mapping.
++"""
++import logging
++
++import pytest
++from ocpp.v16 import call
++
++from helpf.dual_csms import BackendUnavailable, DualCSMSManager
++from test_dual_csms_integration import FakeCSMS, configuration, now, running_manager
++
++TAG = "CARD-OF-B-77"
++
++
++def owner_rows(manager):
++    return [tuple(r) for r in manager.db.execute("SELECT owner FROM auth_owners").fetchall()]
++
++
++@pytest.mark.asyncio
++async def test_card_known_only_to_b_charges_with_b(tmp_path, caplog):
++    caplog.set_level(logging.INFO)
++    async with FakeCSMS(auth_status="Invalid") as a, FakeCSMS(transaction_id=555) as b:
++        async with running_manager(configuration(a, b), tmp_path) as (manager, core):
++            result = await manager.call(call.Authorize(id_tag=TAG))
++            assert result.id_tag_info["status"] == "Accepted"
++            assert len(a.received("Authorize")) == 1 and len(b.received("Authorize")) == 1
++            assert manager.local_owner_for(TAG) == "B"
++            assert manager.claim_local(1, TAG)
++            started = await manager.call(call.StartTransaction(connector_id=1, id_tag=TAG, meter_start=10, timestamp=now()))
++            assert started.id_tag_info["status"] == "Accepted"
++            assert a.received("StartTransaction") == [] and len(b.received("StartTransaction")) == 1
++            await manager.call(call.MeterValues(connector_id=1, transaction_id=started.transaction_id,
++                                                meter_value=[{"timestamp": now(), "sampledValue": [{"value": "11"}]}]))
++            await manager.call(call.StopTransaction(transaction_id=started.transaction_id, id_tag=TAG,
++                                                    meter_stop=20, timestamp=now(), reason="Local"))
++            await b_receives(b, "StopTransaction")
++            assert a.received("MeterValues") == [] and a.received("StopTransaction") == []
++            assert b.received("StopTransaction")[0]["transactionId"] == 555
++            # B owns it: A cannot stop it remotely, B could (checked by the existing owner rules)
++    assert all(TAG not in record.getMessage() for record in caplog.records if record.name == "dual_csms")
++    assert any("[B] Authorize Accepted; the charger-side session belongs to B" in r.getMessage() for r in caplog.records)
++
++
++async def b_receives(csms, action):
++    from test_dual_csms_integration import eventually
++    await eventually(lambda: bool(csms.received(action)))
++
++
++@pytest.mark.asyncio
++async def test_card_accepted_by_a_never_asks_b(tmp_path, caplog):
++    caplog.set_level(logging.INFO)
++    async with FakeCSMS() as a, FakeCSMS() as b:
++        async with running_manager(configuration(a, b), tmp_path) as (manager, core):
++            assert (await manager.call(call.Authorize(id_tag=TAG))).id_tag_info["status"] == "Accepted"
++            assert b.received("Authorize") == []
++            assert manager.local_owner_for(TAG) == "A"
++    # every tap tells which CSMS accepted it, without the tag
++    assert any("[A] Authorize Accepted; the charger-side session belongs to A" in r.getMessage() for r in caplog.records)
++    assert all(TAG not in record.getMessage() for record in caplog.records if record.name == "dual_csms")
++
++
++@pytest.mark.asyncio
++async def test_card_rejected_by_both_returns_the_answer_of_a(tmp_path):
++    async with FakeCSMS(auth_status="Blocked") as a, FakeCSMS(auth_status="Invalid") as b:
++        async with running_manager(configuration(a, b), tmp_path) as (manager, core):
++            result = await manager.call(call.Authorize(id_tag=TAG))
++            assert result.id_tag_info["status"] == "Blocked"
++            assert len(b.received("Authorize")) == 1
++            assert owner_rows(manager) == []
++            assert manager.local_owner_for(TAG) == "A"
++
++
++@pytest.mark.asyncio
++async def test_a_offline_falls_through_to_b(tmp_path):
++    async with FakeCSMS() as a, FakeCSMS(transaction_id=9) as b:
++        async with running_manager(configuration(a, b), tmp_path) as (manager, core):
++            await a.go_offline()
++            from test_dual_csms_integration import eventually
++            await eventually(lambda: not manager.ready["A"].is_set())
++            result = await manager.call(call.Authorize(id_tag=TAG))
++            assert result.id_tag_info["status"] == "Accepted"
++            assert manager.local_owner_for(TAG) == "B"
++
++
++@pytest.mark.asyncio
++async def test_claim_made_before_authorize_follows_the_accepting_csms(tmp_path):
++    async with FakeCSMS(auth_status="Invalid") as a, FakeCSMS(transaction_id=77) as b:
++        async with running_manager(configuration(a, b), tmp_path) as (manager, core):
++            assert manager.claim_local(2, TAG)                 # the RFID command path claims first
++            assert manager._live(2)["owner"] == "A"
++            await manager.call(call.Authorize(id_tag=TAG))
++            assert manager._live(2)["owner"] == "B"
++            started = await manager.call(call.StartTransaction(connector_id=2, id_tag=TAG, meter_start=1, timestamp=now()))
++            assert started.id_tag_info["status"] == "Accepted"
++            assert len(b.received("StartTransaction")) == 1 and a.received("StartTransaction") == []
++
++
++@pytest.mark.asyncio
++async def test_cached_card_without_authorize_keeps_its_owner_after_restart(tmp_path):
++    async with FakeCSMS(auth_status="Invalid") as a, FakeCSMS() as b:
++        async with running_manager(configuration(a, b), tmp_path) as (manager, core):
++            await manager.call(call.Authorize(id_tag=TAG))
++        # a new process: the controller's cache skips Authorize, the owner comes from the state file
++        async with running_manager(configuration(a, b), tmp_path) as (manager, core):
++            assert manager.local_owner_for(TAG) == "B"
++            started = await manager.call(call.StartTransaction(connector_id=1, id_tag=TAG, meter_start=1, timestamp=now()))
++            assert started.id_tag_info["status"] == "Accepted"
++            assert len(b.received("StartTransaction")) == 1 and a.received("StartTransaction") == []
++
++
++@pytest.mark.asyncio
++async def test_both_offline_raises_like_before(tmp_path):
++    manager = DualCSMSManager({"enabled": True, "local_csms": "A", "admin_csms": "A", "servers": [
++        {"name": "A", "url": "ws://127.0.0.1:1/ocpp/x"}, {"name": "B", "url": "ws://127.0.0.1:2/ocpp/y"}]}, tmp_path)
++    try:
++        with pytest.raises(BackendUnavailable):
++            await manager._authorize(call.Authorize(id_tag=TAG))
++    finally:
++        await manager.close()
++
++
++@pytest.mark.asyncio
++async def test_cp_rfid_command_start_with_a_card_of_b(tmp_path):
++    """Real CP.py _dual_rfid_command_start + authorize against the real router."""
++    from types import SimpleNamespace
++    from unittest.mock import AsyncMock
++    from test_cp_dual_hooks import extracted
++
++    pulses, gates = [], []
++
++    async def pulse(cid, level):
++        pulses.append((cid, level))
++
++    async def no_sleep(seconds):
++        return None
++
++    async def gate(cid, owner, tag):
++        gates.append((cid, owner))
++        return True
++
++    async with FakeCSMS(auth_status="Invalid") as a, FakeCSMS(transaction_id=4321) as b:
++        async with running_manager(configuration(a, b), tmp_path) as (manager, _):
++            core = extracted("_dual_rfid_command_start", "authorize",
++                             asyncio=SimpleNamespace(sleep=no_sleep),
++                             plc=SimpleNamespace(get_connector_status=lambda cid: ("Preparing", "Available")),
++                             async_remote_start_plc=pulse, _write_file=lambda *args: None)
++            core._dual_manager = manager
++            core.call = manager.call
++            core.allow_rfid_command_start = True
++            core._valid_id_tag = lambda tag: bool(tag)
++            core._dual_local_claims = set()
++            core._dual_connector_busy = lambda cid: False
++            core._active_transaction_id = lambda cid: 0
++            core._clear_stale_stop_latch_for_new_start = lambda *args: None
++            core._abort_session_immediately = AsyncMock()
++            core._ocpp_start_allowed = gate
++            core.auth_timestamps = {}
++            core.AuthorizationCacheEnabled_cfg = "false"
++
++            assert await core._dual_rfid_command_start(1, TAG) is True
++            assert gates == [(1, "A")]                   # first time: the tag is not known yet
++            assert manager._live(1)["owner"] == "B"      # B accepted, the claim follows B
++            assert pulses == [("1", 1), ("1", 0)]
++            started = await manager.call(call.StartTransaction(connector_id=1, id_tag=TAG, meter_start=5, timestamp=now()))
++            assert started.id_tag_info["status"] == "Accepted"
++            assert len(b.received("StartTransaction")) == 1 and a.received("StartTransaction") == []
++            assert manager._live(1)["remote_id"] == 4321
++
++            # the next tap of the same card on head 2 is gated for B straight away
++            assert await core._dual_rfid_command_start(2, TAG) is True
++            assert gates[-1] == (2, "B") and manager._live(2)["owner"] == "B"
++
++
++@pytest.mark.asyncio
++async def test_cp_rfid_command_start_refused_by_both_releases_the_claim(tmp_path):
++    from types import SimpleNamespace
++    from unittest.mock import AsyncMock
++    from test_cp_dual_hooks import extracted
++
++    pulses = []
++
++    async def pulse(cid, level):
++        pulses.append((cid, level))
++
++    async with FakeCSMS(auth_status="Invalid") as a, FakeCSMS(auth_status="Invalid") as b:
++        async with running_manager(configuration(a, b), tmp_path) as (manager, _):
++            core = extracted("_dual_rfid_command_start", "authorize",
++                             plc=SimpleNamespace(get_connector_status=lambda cid: ("Preparing", "Available")),
++                             async_remote_start_plc=pulse, _write_file=lambda *args: None)
++            core._dual_manager = manager
++            core.call = manager.call
++            core.allow_rfid_command_start = True
++            core._valid_id_tag = lambda tag: bool(tag)
++            core._dual_local_claims = set()
++            core._dual_connector_busy = lambda cid: False
++            core._active_transaction_id = lambda cid: 0
++            core._abort_session_immediately = AsyncMock()
++            core.auth_timestamps = {}
++            core.AuthorizationCacheEnabled_cfg = "false"
++            assert await core._dual_rfid_command_start(1, TAG) is False
++            assert manager._live(1) is None and pulses == []
++            assert len(a.received("Authorize")) == 1 and len(b.received("Authorize")) == 1
++
++
++def test_owner_map_stores_a_hash_and_is_bounded(tmp_path):
++    manager = DualCSMSManager({"enabled": True, "local_csms": "A", "admin_csms": "A", "servers": [
++        {"name": "A", "url": "ws://127.0.0.1:1/ocpp/x"}, {"name": "B", "url": "ws://127.0.0.1:2/ocpp/y"}]}, tmp_path)
++    manager._AUTH_OWNER_LIMIT = 3
++    for number in range(5):
++        manager._remember_auth_owner("tag-%d" % number, "B")
++    rows = manager.db.execute("SELECT tag, owner FROM auth_owners").fetchall()
++    assert len(rows) == 3
++    assert all(len(row["tag"]) == 64 and not row["tag"].startswith("tag-") for row in rows)
++    assert manager.local_owner_for("tag-4") == "B" and manager.local_owner_for("tag-0") == "A"
++    manager.db.close()

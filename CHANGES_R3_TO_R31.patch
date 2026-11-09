@@ -1,0 +1,85 @@
+--- R3/helpf/ocpp_smart_charging.py
++++ R31/helpf/ocpp_smart_charging.py
+@@ -4,6 +4,13 @@
+ when profiles in both units constrain a connector, a CompositeSchedule in one
+ unit is rejected rather than reporting a fabricated conversion.  Station-wide
+ maximum profiles use equal shares across active connectors (both when idle).
++
++A Relative ChargePointMaxProfile is supported only when its schedule is one
++constant period with no duration.  This covers CSMS constant-cap commands
++without inventing a station transaction/start-time anchor: the cap applies
++throughout its optional absolute validity window, including idle/restart.
++Timed/multi-period Relative station schedules remain an explicit implementation
++limitation; Absolute/Recurring station schedules retain their declared clocks.
+ """
+ from __future__ import annotations
+ 
+@@ -179,8 +186,8 @@
+             raise ValueError("Unsupported purpose")
+         if kind not in ("Absolute", "Relative", "Recurring"):
+             raise ValueError("Unsupported profile kind")
+-        if purpose == "ChargePointMaxProfile" and (connector_id != 0 or kind == "Relative"):
+-            raise ValueError("Station maximum requires connector zero and absolute time")
++        if purpose == "ChargePointMaxProfile" and connector_id != 0:
++            raise ValueError("Station maximum requires connector zero")
+         if purpose == "TxProfile" and connector_id == 0:
+             raise ValueError("Transaction profile requires a connector")
+         transaction_id = profile.get("transaction_id")
+@@ -244,6 +251,11 @@
+             last = point
+         if periods[0]["start_period"] != 0:
+             raise ValueError("Schedule must begin at zero")
++        if (self._constant_relative_station_max(profile) and
++                (duration is not None or len(periods) != 1)):
++            # OCPP permits a situation-specific Relative origin determined by
++            # the CP. We do not guess a shared origin from either head's start.
++            raise ValueError("Relative station maximum supports only a constant, indefinite schedule")
+         return {"connector_id": connector_id, "profile": profile,
+                 "installed_at": self._now(), "bound_transaction_id": bound,
+                 "excluded_connectors": []}
+@@ -313,6 +325,13 @@
+             return self._transaction_anchor(cid, self.active_transaction(cid))
+         return _epoch(profile["charging_schedule"]["start_schedule"])
+ 
++    @staticmethod
++    def _constant_relative_station_max(profile):
++        # _validate enforces one period at zero and no duration for this form.
++        # Its value has no schedule-time transition, so no origin is needed.
++        return (profile["charging_profile_purpose"] == "ChargePointMaxProfile" and
++                profile["charging_profile_kind"] == "Relative")
++
+     def _value(self, row, cid, instant):
+         profile = row["profile"]
+         if row["connector_id"] not in (0, cid):
+@@ -325,13 +344,16 @@
+             return None
+         if profile.get("valid_to") and instant >= _epoch(profile["valid_to"]):
+             return None
+-        anchor = self._anchor(row, cid)
+-        if anchor is None and profile["charging_profile_kind"] == "Relative" and self.active_transaction(cid):
+-            raise SmartChargingStateError("Actual transaction start time is unavailable")
+-        if anchor is None or instant < anchor:
+-            return None
+         schedule = profile["charging_schedule"]
+-        elapsed = instant - anchor
++        if self._constant_relative_station_max(profile):
++            elapsed = 0
++        else:
++            anchor = self._anchor(row, cid)
++            if anchor is None and profile["charging_profile_kind"] == "Relative" and self.active_transaction(cid):
++                raise SmartChargingStateError("Actual transaction start time is unavailable")
++            if anchor is None or instant < anchor:
++                return None
++            elapsed = instant - anchor
+         cycle = None
+         if profile["charging_profile_kind"] == "Recurring":
+             cycle = 86400 if profile["recurrency_kind"] == "Daily" else 7 * 86400
+@@ -568,6 +590,8 @@
+                     point = _epoch(profile[field])
+                     if begin < point < end:
+                         points.add(point)
++            if self._constant_relative_station_max(profile):
++                continue
+             anchor = self._anchor(row, cid)
+             if anchor is None:
+                 continue

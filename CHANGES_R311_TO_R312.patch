@@ -1,0 +1,211 @@
+--- R3.1.1/CP.py
++++ R3.1.2/CP.py
+@@ -38,7 +38,7 @@
+     VectorFaultRecord,
+ )
+ from helpf.dual_csms import DualCSMSManager, DualCSMSError, validate_config, check_single_csms_fallback, command_origin
+-from helpf.ocpp_runtime import OCPPProtocolMixin
++from helpf.ocpp_runtime import OCPPProtocolMixin, service_status_active
+ from helpf.len_meter_test import *
+ from helpf.plc_function import (
+     initialize_plc_runtime,
+@@ -1400,6 +1400,8 @@
+     async def call(self, payload, *args, **kwargs):
+         runtime = getattr(self, "_protocol_runtime", None)
+         if runtime is not None:
++            if self._ocpp_hides_service_status(payload):
++                return call_result.StatusNotification()
+             payload = runtime.filter_status(payload)
+         # Observe successful calls only; preserve the original result/exception.
+         if self._dual_manager is not None:
+@@ -1826,7 +1828,11 @@
+             state, _ = plc.get_connector_status(str(cid))
+         except Exception as error:
+             return "PLC state unreadable (%s)" % type(error).__name__
+-        if state not in ("Available", "Preparing"):
++        # [R3.1.2] An EV in CP state C without CurrentDemand is reported by the PLC as
++        # SuspendedEV while it waits for authorisation. With no transaction (checked above)
++        # _ocpp_physical_status() and the CSMS see Preparing, so it must not block a
++        # RemoteStart. Charging (energy flowing) without a transaction stays busy.
++        if state not in ("Available", "Preparing", "SuspendedEV", "SuspendedEVSE"):
+             return "PLC reports %s" % state
+         return ""
+ 
+@@ -2341,7 +2347,27 @@
+         if self._active_transaction_id(connector) <= 0:
+             await self._abort_session_immediately(connector)
+ 
++    def _ocpp_vector_fault_active(self, connector):
++        try:
++            return bool(self._vector_fault_blocks_normal_status(connector))
++        except Exception:
++            return False
++
++    def _ocpp_hides_service_status(self, payload):
++        """[R3.1.2] While the Vector fault bridge reports a connector Faulted, a status from the
++        R3 service layer (startup announcement, availability, reservation) must not replace it:
++        on 2026-11-09 the startup announcement sent Available over an active PM fault."""
++        if type(payload).__name__ != "StatusNotification" or not service_status_active():
++            return False
++        connector = getattr(payload, "connector_id", None)
++        if not self._ocpp_vector_fault_active(connector):
++            return False
++        self._log_vector_fault_suppression(connector, "service %s" % payload.status)
++        return True
++
+     def _ocpp_physical_status(self, connector):
++        if self._ocpp_vector_fault_active(connector):
++            return "Faulted"   # [R3.1.2] what the CSMS is shown while a Vector fault is active
+         if connector == 0:
+             return "Available"
+         raw = str(getattr(self, f"iCpStateCss{connector}", "Available"))
+--- R3.1.1/helpf/ocpp_runtime.py
++++ R3.1.2/helpf/ocpp_runtime.py
+@@ -27,6 +27,12 @@
+ _TRIGGER_METER = ContextVar("ocpp_trigger_meter", default=False)
+ 
+ 
++def service_status_active():
++    """True while publish_status() sends a status from this service layer
++    (availability, reservation, startup announcement or limit fault)."""
++    return _SERVICE_STATUS.get()
++
++
+ class OCPPProtocolRuntime:
+     def __init__(self, core, directory, config=None):
+         self.core = core
+--- R3.1.1/tests/test_r311_start_refusal_logging.py
++++ R3.1.2/tests/test_r311_start_refusal_logging.py
+@@ -163,7 +163,11 @@
+     ("Available", 0.0, "", False),
+     ("Preparing", 0.0, "", False),
+     ("Finishing", 0.0, "PLC reports Finishing", True),
+-    ("SuspendedEV", 0.0, "PLC reports SuspendedEV", True),
++    # R3.1.2: an EV waiting for authorisation (state C, no CurrentDemand) is not busy
++    ("SuspendedEV", 0.0, "", False),
++    ("SuspendedEVSE", 0.0, "", False),
++    ("Charging", 0.0, "PLC reports Charging", True),
++    ("Faulted", 0.0, "PLC reports Faulted", True),
+     (None, 0.0, "PLC state unreadable (TimeoutError)", True),
+     ("Preparing", 12.5, "start request from the charger screen pending", True),
+ ])
+--- R3.1.1/tools/cp_protocol_defs.py
++++ R3.1.2/tools/cp_protocol_defs.py
+@@ -1,5 +1,5 @@
+ # Pure protocol AST export for the SIMULATOR, not the charger application.
+-# Original CP.py SHA256: 455be4577055a94fe2fb3725f11fd80fe4a1a49e4110b55a95f9b60dbbc86f75
++# Original CP.py SHA256: bea85fa1f0e017881c1f05db248ccf0af847257062d7c2e621738e48ea66d39a
+ def _normalize_autocharge_prefix(value):
+     """Return a valid AutoCharge idTag prefix, or None if the value is not allowed."""
+     text = str(value if value is not None else '').strip()
+--- /dev/null
++++ R3.1.2/tests/test_r312_vector_status.py
+@@ -0,0 +1,108 @@
++"""R3.1.2: R3's service layer must not hide a Vector fault, and start admission must see it.
++
++Found on the factory Edgebox on 2026-11-09 15:15: the Vector bridge sent Faulted for
++connectors 1 and 2 (active PM faults) and, a moment later, the R3 startup announcement sent
++Available for both, so A and B showed free connectors while the faults were still active.
++"""
++import ast
++import asyncio
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++from ocpp.v16 import call, call_result
++
++from helpf import ocpp_runtime
++from helpf.ocpp_runtime import OCPPProtocolRuntime, service_status_active
++
++SOURCE = Path(__file__).resolve().parents[1] / "CP.py"
++NAMES = ("_ocpp_vector_fault_active", "_ocpp_hides_service_status", "_ocpp_physical_status",
++         "_vector_fault_blocks_normal_status")
++
++
++def core(active=(), enabled=True, raw="Available", transaction=0):
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ChargePoint")
++    nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in NAMES]
++    assert sorted(n.name for n in nodes) == sorted(NAMES)
++    module = ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(
++        name="Core", bases=[], keywords=[], body=nodes, decorator_list=[])], type_ignores=[]))
++    env = {"VECTOR_FAULT_BRIDGE_ENABLED": enabled, "service_status_active": service_status_active}
++    exec(compile(module, str(SOURCE), "exec"), env)
++    instance = env["Core"]()
++    instance.vector_fault_bridge = SimpleNamespace(has_active=lambda cid: cid in active)
++    instance.suppressed = []
++    instance._log_vector_fault_suppression = lambda cid, status: instance.suppressed.append((cid, status))
++    instance.iCpStateCss1 = instance.iCpStateCss2 = raw
++    instance._active_transaction_id = lambda cid: transaction
++    return instance
++
++
++def status(connector, value="Available"):
++    return call.StatusNotification(connector_id=connector, error_code="NoError", status=value)
++
++
++def test_physical_status_is_faulted_while_vector_fault_is_active():
++    assert core(active={1})._ocpp_physical_status(1) == "Faulted"
++    assert core(active={0})._ocpp_physical_status(0) == "Faulted"
++    assert core(active={1})._ocpp_physical_status(2) == "Available"
++    # unchanged R3 mapping when no Vector fault is active
++    assert core(raw="SuspendedEV")._ocpp_physical_status(1) == "Preparing"
++    assert core(raw="SuspendedEV", transaction=7)._ocpp_physical_status(1) == "SuspendedEV"
++    assert core(active={1}, enabled=False)._ocpp_physical_status(1) == "Available"
++
++
++def test_physical_status_falls_back_when_the_bridge_is_not_ready():
++    instance = core()
++    del instance.vector_fault_bridge
++    assert instance._ocpp_physical_status(1) == "Available"
++
++
++def test_service_status_is_hidden_only_for_a_vector_faulted_connector():
++    instance = core(active={1})
++    token = ocpp_runtime._SERVICE_STATUS.set(True)
++    try:
++        assert instance._ocpp_hides_service_status(status(1)) is True
++        assert instance._ocpp_hides_service_status(status(2)) is False
++        assert instance._ocpp_hides_service_status(call.Heartbeat()) is False
++    finally:
++        ocpp_runtime._SERVICE_STATUS.reset(token)
++    # statuses from the normal CP.py path keep their own Vector gate
++    assert instance._ocpp_hides_service_status(status(1)) is False
++    assert instance.suppressed == [(1, "service Available")]
++
++
++def test_publish_status_marks_its_calls_as_service_statuses():
++    seen = []
++
++    class Core:
++        async def call(self, payload):
++            seen.append((type(payload).__name__, payload.status, service_status_active()))
++            return call_result.StatusNotification()
++
++    fake = SimpleNamespace(core=Core(), faulted=set())
++    asyncio.run(OCPPProtocolRuntime.publish_status(fake, 1, "Available"))
++    assert seen == [("StatusNotification", "Available", True)]
++    assert service_status_active() is False
++
++
++@pytest.mark.parametrize("physical, expected", [("Faulted", "connector status Faulted"),
++                                                ("Preparing", "start not allowed")])
++def test_start_refusal_names_a_vector_fault(physical, expected):
++    services = SimpleNamespace(_operative=lambda cid: True, physical_status=lambda cid: physical,
++                               _reservations=lambda: [])
++    fake = SimpleNamespace(ready=True, faulted=set(), smart=SimpleNamespace(inhibited=False, last_error=None),
++                           services=services)
++    assert OCPPProtocolRuntime.start_refusal(fake, 1) == expected
++
++
++def test_chargepoint_call_drops_hidden_service_status_before_the_router():
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ChargePoint")
++    method = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "call")
++    first = method.body[1]
++    assert isinstance(first, ast.If)                       # if runtime is not None:
++    guard = first.body[0]
++    assert isinstance(guard, ast.If) and "_ocpp_hides_service_status" in ast.unparse(guard.test)
++    assert "call_result.StatusNotification()" in ast.unparse(guard.body[0])
++    assert "filter_status" in ast.unparse(first.body[1])  # the filter still runs for kept statuses

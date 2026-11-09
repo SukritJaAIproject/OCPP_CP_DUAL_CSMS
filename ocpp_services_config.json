@@ -1,0 +1,15 @@
+{
+  "firmware_mode": "download_and_stage",
+  "rated_power_w": 180000,
+  "station_rated_power_w": 180000,
+  "rated_current_a": 500,
+  "diagnostic_sources": ["ocpp_runtime_events.jsonl"],
+  "transfer": {
+    "allowed_hosts": ["csms-a.example.com", "csms-b.example.com"],
+    "allow_http_hosts": ["csms-b.example.com"],
+    "timeout": 20,
+    "max_download_bytes": 67108864,
+    "max_upload_bytes": 4194304
+  },
+  "trusted_firmware_sha256": {}
+}

@@ -1,0 +1,21 @@
+{
+  "simulator": true,
+  "enabled": true,
+  "local_csms": "A",
+  "admin_csms": "A",
+  "request_timeout": 15,
+  "reconnect_seconds": 15,
+  "meter_queue_limit": 2000,
+  "servers": [
+    {
+      "name": "A",
+      "enabled": true,
+      "url": "wss://csms-a.example.com/ocpp/CP-A-0001-TEST-PC-9F3A"
+    },
+    {
+      "name": "B",
+      "enabled": true,
+      "url": "ws://csms-b.example.com:9000/ocpp/CP-B-0001-TEST-PC-9F3A"
+    }
+  ]
+}

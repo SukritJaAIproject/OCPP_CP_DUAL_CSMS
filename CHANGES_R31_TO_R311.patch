@@ -1,0 +1,384 @@
+--- R3.1/CP.py
++++ R3.1.1/CP.py
+@@ -1780,32 +1780,55 @@
+     # ========================================================================
+     def _dual_connector_busy(self, connector_id):
+         """Physical/core guard. The router checks its own persistent claim too."""
++        return bool(self._dual_busy_reason(connector_id))
++
++    def _dual_busy_reason(self, connector_id):
++        """Why _dual_connector_busy() refuses a new start; "" when the head is free.
++
++        [R3.1.1] Same conditions in the same order as R3.1 (take_local_request() and
++        the PLC read still run only when every earlier check passed). The text is
++        only for the log and never contains an idTag."""
+         cid = int(connector_id)
+         runtime = getattr(self, "_protocol_runtime", None)
+-        if runtime is not None and (cid in runtime.faulted or runtime.smart.inhibited
+-                                    or not runtime.services._operative(cid)):
+-            return True
+-        if not self._dual_ready or cid in self._dual_aborting or cid in self._dual_local_claims:
+-            return True
+-        if self._active_transaction_id(cid) > 0 or self._remote_stop_worker_running(cid):
+-            return True
+-        if self._session_finishing_active(cid) or self._local_status_session_active(cid):
+-            return True
++        if runtime is not None:
++            if cid in runtime.faulted:
++                return "connector faulted after a PLC limit failure"
++            if runtime.smart.inhibited:
++                return "smart charging inhibited (%s)" % (runtime.smart.last_error or "unknown error")
++            if not runtime.services._operative(cid):
++                return "connector Inoperative"
++        if not self._dual_ready:
++            return "charger startup not finished"
++        if cid in self._dual_aborting:
++            return "previous start is being aborted"
++        if cid in self._dual_local_claims:
++            return "local RFID start in progress"
++        txn = self._active_transaction_id(cid)
++        if txn > 0:
++            return "transaction %s is active" % txn
++        if self._remote_stop_worker_running(cid):
++            return "remote stop still running"
++        if self._session_finishing_active(cid):
++            return "previous session finishing - unplug the cable first"
++        if self._local_status_session_active(cid):
++            return "session started from the charger screen"
+         for name in (f"remote_start_received_c{cid}", f"myremotestart_c{cid}",
+                      f"rfid_start_received_c{cid}", f"rfid_recovery_pending_c{cid}"):
+             if int(getattr(self, name, 0) or 0) == 1:
+-                return True
++                return name + "=1"
+         if int(getattr(self, f"start_transaction_SW{cid}", 0) or 0) == 3:
+-            return True
++            return "start already sent to the PLC (start_transaction_SW%s=3)" % cid
+         if self._valid_id_tag(getattr(self, f"accepted_tag{cid}", "0")):
+-            return True
++            return "an accepted RFID tag is waiting for its start"
+         if take_local_request("start", cid) > 0:
+-            return True
++            return "start request from the charger screen pending"
+         try:
+             state, _ = plc.get_connector_status(str(cid))
+-            return state not in ("Available", "Preparing")
+-        except Exception:
+-            return True
++        except Exception as error:
++            return "PLC state unreadable (%s)" % type(error).__name__
++        if state not in ("Available", "Preparing"):
++            return "PLC reports %s" % state
++        return ""
+ 
+     async def _dual_rfid_command_start(self, connector_id, id_tag):
+         """Run MQTT RFID arbitration on the same loop as the OCPP handlers."""
+@@ -4226,6 +4249,12 @@
+         manager = getattr(self, "_dual_manager", None)
+         if gate is not None and not await gate(connector_id, command_origin(
+                 manager.config["local_csms"] if manager is not None else "A"), id_tag):
++            explain = getattr(self, "_ocpp_start_refusal", None)
++            try:
++                reason = explain(connector_id) if explain else "start not allowed"
++            except Exception as error:
++                reason = "start not allowed (%s)" % type(error).__name__
++            logging.warning(f"[REMOTE-START] reject C{connector_id}: {reason}")
+             return call_result.RemoteStartTransaction(status=RemoteStartStopStatus.rejected)
+         if self._active_transaction_id(connector_id) > 0 or self._remote_stop_worker_running(connector_id):
+             logging.warning(
+--- R3.1/helpf/dual_csms.py
++++ R3.1.1/helpf/dual_csms.py
+@@ -871,6 +871,25 @@
+                         "(SELECT message_id FROM commands WHERE server=? AND response IS NOT NULL ORDER BY created DESC LIMIT 2048)", (server, server))
+         self.db.commit()
+ 
++    def _refuse_start(self, server, connector, reason):
++        # Field diagnosis: every refusal names its reason. Never log the idTag.
++        LOG.warning("[%s] RemoteStart C%s rejected: %s", server, connector, reason)
++        return self._rejected("RemoteStartTransaction")
++
++    def _start_refusal(self, connector):
++        explain = getattr(self.core, "_ocpp_start_refusal", None)
++        try:
++            return explain(connector) if explain else "start not allowed"
++        except Exception as error:
++            return "start not allowed (%s)" % type(error).__name__
++
++    def _busy_reason(self, connector):
++        explain = getattr(self.core, "_dual_busy_reason", None)
++        try:
++            return (explain(connector) or "connector busy") if explain else "connector busy"
++        except Exception as error:
++            return "connector busy (%s)" % type(error).__name__
++
+     @staticmethod
+     def _rejected(action):
+         if action == "GetDiagnostics":
+@@ -885,18 +904,22 @@
+         if server not in self.servers or self.core is None:
+             raise DualCSMSError("Unknown CSMS or no physical controller bound")
+         if not self.ready[server].is_set():
++            if action == "RemoteStartTransaction":
++                return self._refuse_start(server, kwargs.get("connector_id"), "this CSMS has not accepted the BootNotification yet")
+             return self._rejected(action) if action not in ("GetConfiguration", "GetLocalListVersion") else await self._invoke(action, kwargs, server)
+         if action == "RemoteStartTransaction":
+             connector = kwargs.get("connector_id")
+             if isinstance(connector, bool) or connector not in (1, 2):
+-                return self._rejected(action)
++                return self._refuse_start(server, connector, "invalid connector")
+             if not getattr(self.core, "_dual_ready", False):
+-                return self._rejected(action)
+-            if self.connector_reserved(connector):
+-                return self._rejected(action)
++                return self._refuse_start(server, connector, "charger startup not finished")
++            live = self._live(connector)
++            if live is not None:
++                return self._refuse_start(server, connector, "already claimed by %s session %s (%s)"
++                                          % (live["owner"], live["local_id"], live["state"]))
+             busy = getattr(self.core, "_dual_connector_busy", None)
+             if busy and busy(connector):
+-                return self._rejected(action)
++                return self._refuse_start(server, connector, self._busy_reason(connector))
+             row = self._reserve(connector, server, str(kwargs.get("id_tag", "")))
+             try:
+                 admission = getattr(self.core, "_ocpp_start_admission", None)
+@@ -904,7 +927,7 @@
+                     decision = admission(connector, server, str(kwargs.get("id_tag", "")))
+                     if decision is False:
+                         self.release_pending(connector)
+-                        return self._rejected(action)
++                        return self._refuse_start(server, connector, self._start_refusal(connector))
+                     if decision is None:
+                         # This peer's reader cannot await Authorize.conf while
+                         # it is still handling RemoteStart.req. Keep the claim,
+@@ -917,7 +940,7 @@
+                     allowed = await allowed
+                 if not allowed:
+                     self.release_pending(connector)
+-                    return self._rejected(action)
++                    return self._refuse_start(server, connector, self._start_refusal(connector))
+                 result = await self._invoke(action, kwargs, server)
+             except Exception:
+                 # Dispatch may have changed hardware intent before raising. Keep
+--- R3.1/helpf/ocpp_runtime.py
++++ R3.1.1/helpf/ocpp_runtime.py
+@@ -223,6 +223,23 @@
+         return (self.ready and connector not in self.faulted and not self.smart.inhibited
+                 and self.services.can_start(connector, owner, tag, self.parent_tag(tag, owner)))
+ 
++    def start_refusal(self, connector):
++        """Why a new start is refused, for the log only. Never contains an idTag."""
++        if not self.ready:
++            return "protocol runtime not ready"
++        if connector in self.faulted:
++            return "connector faulted after a PLC limit failure"
++        if self.smart.inhibited:
++            return "smart charging inhibited (%s)" % (self.smart.last_error or "unknown error")
++        if not self.services._operative(connector):
++            return "connector Inoperative"
++        status = str(self.services.physical_status(connector))
++        if status not in ("Available", "Preparing", "Reserved"):
++            return "connector status %s" % status
++        if any(row["connector_id"] in (0, connector) for row in self.services._reservations()):
++            return "reserved for another idTag or CSMS"
++        return "start not allowed"
++
+     def start_admission(self, connector, owner, tag):
+         """None requests async parent verification after the CALLRESULT is sent."""
+         if connector in self.faulted or self.smart.inhibited:
+@@ -316,6 +333,9 @@
+     async def _ocpp_start_allowed(self, connector, owner, tag):
+         return await self._ocpp_protocol().start_allowed(connector, owner, tag)
+ 
++    def _ocpp_start_refusal(self, connector):
++        return self._ocpp_protocol().start_refusal(connector)
++
+     def _ocpp_start_admission(self, connector, owner, tag):
+         return self._ocpp_protocol().start_admission(connector, owner, tag)
+ 
+--- R3.1/tools/cp_protocol_defs.py
++++ R3.1.1/tools/cp_protocol_defs.py
+@@ -1,5 +1,5 @@
+ # Pure protocol AST export for the SIMULATOR, not the charger application.
+-# Original CP.py SHA256: f528f20bdcdf0ff5698b45430620c7741477c5061409cd985437539a214bc222
++# Original CP.py SHA256: 455be4577055a94fe2fb3725f11fd80fe4a1a49e4110b55a95f9b60dbbc86f75
+ def _normalize_autocharge_prefix(value):
+     """Return a valid AutoCharge idTag prefix, or None if the value is not allowed."""
+     text = str(value if value is not None else '').strip()
+--- /dev/null
++++ R3.1.1/tests/test_r311_start_refusal_logging.py
+@@ -0,0 +1,175 @@
++"""R3.1.1: every refused RemoteStart names its reason in the log; behaviour is unchanged.
++
++Found on the factory Edgebox on 2026-11-09: a RemoteStart from A was answered
++Rejected and nothing in the log said why. These checks pin the reason texts, that
++no idTag is logged, and that CP.py's guard keeps R3.1's conditions and order.
++"""
++import ast
++import logging
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++from helpf.ocpp_runtime import OCPPProtocolRuntime
++from test_dual_csms_integration import FakeCSMS, FakeCore, configuration, running_manager
++
++SOURCE = Path(__file__).resolve().parents[1] / "CP.py"
++SECRET_TAG = "SECRET-TAG-77"  # <= 20 chars (CiString20)
++
++
++def refusals(caplog):
++    return [r.getMessage() for r in caplog.records if "RemoteStart C" in r.getMessage()]
++
++
++class ExplainingCore(FakeCore):
++    def __init__(self):
++        super().__init__()
++        self.reason = ""
++
++    def _dual_connector_busy(self, connector_id):
++        return bool(self.reason) or super()._dual_connector_busy(connector_id)
++
++    def _dual_busy_reason(self, connector_id):
++        return self.reason
++
++
++@pytest.mark.asyncio
++async def test_router_names_claim_busy_and_startup_reasons_without_tags(tmp_path, caplog):
++    caplog.set_level(logging.WARNING, logger="dual_csms")
++    async with FakeCSMS() as a, FakeCSMS() as b:
++        core = ExplainingCore()
++        async with running_manager(configuration(a, b), tmp_path, core=core) as (manager, _):
++            payload = {"connectorId": 1, "idTag": SECRET_TAG}
++            assert await a.request("RemoteStartTransaction", payload) == {"status": "Accepted"}
++            assert await b.request("RemoteStartTransaction", payload) == {"status": "Rejected"}
++            assert any(m.startswith("[B] RemoteStart C1 rejected: already claimed by A session")
++                       and "(reserved)" in m for m in refusals(caplog))
++
++            core.reason = "previous session finishing - unplug the cable first"
++            assert await a.request("RemoteStartTransaction", {"connectorId": 2, "idTag": SECRET_TAG}) == {"status": "Rejected"}
++            assert "[A] RemoteStart C2 rejected: previous session finishing - unplug the cable first" in refusals(caplog)
++
++            core.reason = ""
++            core._dual_ready = False
++            assert await a.request("RemoteStartTransaction", {"connectorId": 2, "idTag": SECRET_TAG}) == {"status": "Rejected"}
++            assert "[A] RemoteStart C2 rejected: charger startup not finished" in refusals(caplog)
++    assert all(SECRET_TAG not in r.getMessage() for r in caplog.records)
++
++
++@pytest.mark.asyncio
++async def test_router_reports_plain_busy_for_a_core_without_reasons(tmp_path, caplog):
++    caplog.set_level(logging.WARNING, logger="dual_csms")
++    async with FakeCSMS() as a, FakeCSMS() as b:
++        core = FakeCore()
++        core.pending.add(1)   # FakeCore treats a pending start as busy
++        async with running_manager(configuration(a, b), tmp_path, core=core) as (manager, _):
++            assert await a.request("RemoteStartTransaction", {"connectorId": 1, "idTag": "x"}) == {"status": "Rejected"}
++    assert "[A] RemoteStart C1 rejected: connector busy" in refusals(caplog)
++
++
++def runtime(**overrides):
++    services = SimpleNamespace(_operative=lambda cid: True, physical_status=lambda cid: "Preparing",
++                               _reservations=lambda: [])
++    fake = SimpleNamespace(ready=True, faulted=set(), smart=SimpleNamespace(inhibited=False, last_error=None),
++                           services=services)
++    for key, value in overrides.items():
++        setattr(fake, key, value)
++    return fake
++
++
++@pytest.mark.parametrize("fake, expected", [
++    (runtime(ready=False), "protocol runtime not ready"),
++    (runtime(faulted={1}), "connector faulted after a PLC limit failure"),
++    (runtime(smart=SimpleNamespace(inhibited=True, last_error="RuntimeError")),
++     "smart charging inhibited (RuntimeError)"),
++    (runtime(services=SimpleNamespace(_operative=lambda cid: False, physical_status=lambda cid: "Available",
++                                      _reservations=lambda: [])), "connector Inoperative"),
++    (runtime(services=SimpleNamespace(_operative=lambda cid: True, physical_status=lambda cid: "Faulted",
++                                      _reservations=lambda: [])), "connector status Faulted"),
++    (runtime(services=SimpleNamespace(_operative=lambda cid: True, physical_status=lambda cid: "Available",
++                                      _reservations=lambda: [{"connector_id": 0}])),
++     "reserved for another idTag or CSMS"),
++    (runtime(), "start not allowed"),
++])
++def test_runtime_start_refusal_texts(fake, expected):
++    assert OCPPProtocolRuntime.start_refusal(fake, 1) == expected
++
++
++def cp_guard(plc_state="Preparing", local_request=0.0):
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ChargePoint")
++    names = ("_dual_connector_busy", "_dual_busy_reason", "_valid_id_tag")
++    nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
++    assert len(nodes) == len(names)
++    calls = []
++
++    def take_local_request(kind, cid):
++        calls.append(("take_local_request", kind, cid))
++        return local_request
++
++    def get_connector_status(cid):
++        calls.append(("plc", cid))
++        if plc_state is None:
++            raise TimeoutError("no PLC")
++        return plc_state, plc_state
++
++    module = ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(
++        name="Core", bases=[], keywords=[], body=nodes, decorator_list=[])], type_ignores=[]))
++    env = {"take_local_request": take_local_request, "staticmethod": staticmethod,
++           "plc": SimpleNamespace(get_connector_status=get_connector_status)}
++    exec(compile(module, str(SOURCE), "exec"), env)
++    core = env["Core"]()
++    core._dual_ready = True
++    core._dual_aborting, core._dual_local_claims = set(), set()
++    core._protocol_runtime = SimpleNamespace(faulted=set(), smart=SimpleNamespace(inhibited=False, last_error=None),
++                                             services=SimpleNamespace(_operative=lambda cid: True))
++    core.txn = 0
++    core.finishing = core.local_session = core.stop_worker = False
++    core._active_transaction_id = lambda cid: core.txn
++    core._remote_stop_worker_running = lambda cid: core.stop_worker
++    core._session_finishing_active = lambda cid: core.finishing
++    core._local_status_session_active = lambda cid: core.local_session
++    for cid in (1, 2):
++        for name in ("remote_start_received", "myremotestart", "rfid_start_received", "rfid_recovery_pending"):
++            setattr(core, f"{name}_c{cid}", 0)
++        setattr(core, f"start_transaction_SW{cid}", 1)
++        setattr(core, f"accepted_tag{cid}", "0")
++    return core, calls
++
++
++@pytest.mark.parametrize("setup, expected", [
++    (lambda c: setattr(c, "_dual_ready", False), "charger startup not finished"),
++    (lambda c: c._dual_local_claims.add(1), "local RFID start in progress"),
++    (lambda c: setattr(c, "txn", 41), "transaction 41 is active"),
++    (lambda c: setattr(c, "stop_worker", True), "remote stop still running"),
++    (lambda c: setattr(c, "finishing", True), "previous session finishing - unplug the cable first"),
++    (lambda c: setattr(c, "local_session", True), "session started from the charger screen"),
++    (lambda c: setattr(c, "remote_start_received_c1", 1), "remote_start_received_c1=1"),
++    (lambda c: setattr(c, "start_transaction_SW1", 3), "start already sent to the PLC (start_transaction_SW1=3)"),
++    (lambda c: setattr(c, "accepted_tag1", "CARD"), "an accepted RFID tag is waiting for its start"),
++    (lambda c: c._protocol_runtime.faulted.add(1), "connector faulted after a PLC limit failure"),
++])
++def test_cp_guard_reasons_stop_before_the_hardware_read(setup, expected):
++    core, calls = cp_guard()
++    setup(core)
++    assert core._dual_busy_reason(1) == expected
++    assert core._dual_connector_busy(1) is True
++    assert calls == []          # like R3.1: nothing after the first failed check runs
++    assert "CARD" not in expected
++
++
++@pytest.mark.parametrize("plc_state, local_request, expected, busy", [
++    ("Available", 0.0, "", False),
++    ("Preparing", 0.0, "", False),
++    ("Finishing", 0.0, "PLC reports Finishing", True),
++    ("SuspendedEV", 0.0, "PLC reports SuspendedEV", True),
++    (None, 0.0, "PLC state unreadable (TimeoutError)", True),
++    ("Preparing", 12.5, "start request from the charger screen pending", True),
++])
++def test_cp_guard_plc_and_screen_reasons(plc_state, local_request, expected, busy):
++    core, calls = cp_guard(plc_state, local_request)
++    assert core._dual_busy_reason(1) == expected
++    assert core._dual_connector_busy(1) is busy
++    assert calls[0] == ("take_local_request", "start", 1)
++    assert (("plc", "1") in calls) is (local_request <= 0)
