@@ -14,7 +14,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
-    <img alt="CSMS A and CSMS B each keep their own OCPP 1.6J WebSocket connection to the Edgebox. Inside, the dual-CSMS router owns the session table and outbox, CP.py drives the PLC over MQTT, and the service layer handles smart charging, reservations and firmware jobs." src="docs/images/architecture-light.svg" width="900">
+    <img alt="CSMS A and CSMS B each keep their own OCPP 1.6J WebSocket connection to the Edgebox. Inside, the dual-CSMS router owns the session table and outbox, CP.py drives the PLC over MQTT, and the service layer handles smart charging, reservations and firmware jobs." src="docs/images/architecture-light.svg" width="880">
   </picture>
 </p>
 
@@ -77,7 +77,7 @@ The example below shows two sessions at once. Connector 1 belongs to CSMS A and 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/session-routing-dark.svg">
-    <img alt="Sequence: CSMS A starts connector 1 and CSMS B starts connector 2. Each StartTransaction and MeterValues goes only to its owner. StatusNotification goes to both with the owner in info. A RemoteStop from CSMS A for B's session is rejected; B stops its own session." src="docs/images/session-routing-light.svg" width="900">
+    <img alt="Sequence: CSMS A starts connector 1 and CSMS B starts connector 2. Each StartTransaction and MeterValues goes only to its owner. StatusNotification goes to both with the owner in info. A RemoteStop from CSMS A for B's session is rejected; B stops its own session." src="docs/images/session-routing-light.svg" width="880">
   </picture>
 </p>
 
@@ -94,7 +94,7 @@ The example below shows two sessions at once. Connector 1 belongs to CSMS A and 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/rfid-authorization-dark.svg">
-    <img alt="Flow: a card tapped at the charger is authorized by CSMS A. If A accepts, the session belongs to A. If A answers Invalid, Blocked, Expired or does not answer, CSMS B is asked. If B accepts, the session belongs to B. Otherwise the charge does not start." src="docs/images/rfid-authorization-light.svg" width="820">
+    <img alt="Flow: a card tapped at the charger is authorized by CSMS A. If A accepts, the session belongs to A. If A answers Invalid, Blocked, Expired or does not answer, CSMS B is asked. If B accepts, the session belongs to B. Otherwise the charge does not start." src="docs/images/rfid-authorization-light.svg" width="880">
   </picture>
 </p>
 
@@ -110,7 +110,7 @@ Measured on the factory test charger on 9 Nov 2026. CSMS A charges a car on conn
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/power-sharing-dark.svg">
-    <img alt="Two panels over five minutes. Connector 1 (CSMS A) has a 120 kW limit and draws about 51 kW. When CSMS B starts connector 2, connector 1 is lowered to 60 kW and connector 2 gets 60 kW; connector 2 draws 60.1 kW at the first sample, then about 50 kW. When connector 2 stops, connector 1 returns to 120 kW." src="docs/images/power-sharing-light.svg" width="900">
+    <img alt="Two panels over five minutes. Connector 1 (CSMS A) has a 120 kW limit and draws about 51 kW. When CSMS B starts connector 2, connector 1 is lowered to 60 kW and connector 2 gets 60 kW; connector 2 draws 60.1 kW at the first sample, then about 50 kW. When connector 2 stops, connector 1 returns to 120 kW." src="docs/images/power-sharing-light.svg" width="880">
   </picture>
 </p>
 
