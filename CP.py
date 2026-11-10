@@ -390,6 +390,17 @@ try:
 except Exception:
     RFID_STOP_SELECT_TTL_SECONDS = 30.0
 
+# [START-LATCH] R3.1.6. A RemoteStart sent to the PLC that never reached StartTransaction
+# keeps its head for at most this long while the PLC shows no EV session (Available or
+# Preparing); the next start request then releases it instead of being refused. Flags
+# whose session has provably ended are released at once, without waiting.
+try:
+    REMOTE_START_LATCH_TIMEOUT_SECONDS = max(
+        30.0, float(os.getenv("REMOTE_START_LATCH_TIMEOUT_SECONDS", "180"))
+    )
+except Exception:
+    REMOTE_START_LATCH_TIMEOUT_SECONDS = 180.0
+
 # [PREPARING-TIMEOUT] Plugged in, Preparing sent, but no RemoteStart arrived
 # before the controller's own timeout ended the session.  Reported as Faulted
 # (not Finishing) until the cable is removed.  The timeout itself is set on the
@@ -1793,7 +1804,11 @@ class ChargePoint(OCPPProtocolMixin, cp):
 
         [R3.1.1] Same conditions in the same order as R3.1 (take_local_request() and
         the PLC read still run only when every earlier check passed). The text is
-        only for the log and never contains an idTag."""
+        only for the log and never contains an idTag.
+
+        [R3.1.6] Right before the start flags are checked, flags left by a RemoteStart
+        that ended before StartTransaction are released (_heal_stale_start_latch), so
+        they no longer refuse this start. A start that may still be running is kept."""
         cid = int(connector_id)
         runtime = getattr(self, "_protocol_runtime", None)
         if runtime is not None:
@@ -1818,6 +1833,7 @@ class ChargePoint(OCPPProtocolMixin, cp):
             return "previous session finishing - unplug the cable first"
         if self._local_status_session_active(cid):
             return "session started from the charger screen"
+        self._heal_stale_start_latch(cid)   # [R3.1.6] logs what it releases
         for name in (f"remote_start_received_c{cid}", f"myremotestart_c{cid}",
                      f"rfid_start_received_c{cid}", f"rfid_recovery_pending_c{cid}"):
             if int(getattr(self, name, 0) or 0) == 1:
@@ -1838,6 +1854,128 @@ class ChargePoint(OCPPProtocolMixin, cp):
         # RemoteStart. Charging (energy flowing) without a transaction stays busy.
         if state not in ("Available", "Preparing", "SuspendedEV", "SuspendedEVSE"):
             return "PLC reports %s" % state
+        return ""
+
+    # ------------------------------------------------------------------------
+    # [START-LATCH] R3.1.6
+    # remote_start_transaction() sets myremotestart_cN=1 and remote_start_received_cN=1,
+    # main_run_program() pulses the PLC and sets start_transaction_SWN=3 until
+    # StartTransaction. A RemoteStart whose session ends before StartTransaction has to
+    # release all three, as the card path does with rfid_start_received_cN. On 2026-11-10
+    # (Edgebox 192.168.3.15) the EV ended the session 18 s after the pulse, the cable was
+    # removed, start_transaction_SW2 stayed 3 and every later RemoteStart on head 2 was
+    # refused until CP.py was restarted.
+    # ------------------------------------------------------------------------
+    def _remote_start_latch_age(self, connector_id):
+        """Seconds since this head's RemoteStart latch was set; None when unknown."""
+        cid = int(connector_id)
+        since = getattr(self, f"_remote_start_latch_mono_c{cid}", None)
+        if since is not None:
+            return max(0.0, time.monotonic() - float(since))
+        # After a restart only the state files are left; they were written when it was set.
+        if int(getattr(self, f"start_transaction_SW{cid}", 0) or 0) == 3:
+            name = f"start_transaction_SW{cid}.txt"
+        else:
+            name = f"remote_start_received_c{cid}.txt"
+        try:
+            age = time.time() - os.path.getmtime(name)
+        except (OSError, TypeError, ValueError):
+            return None
+        return age if age >= 0 else None
+
+    def _stale_start_latch_reason(self, connector_id):
+        """Why this head's RemoteStart flags, or the CSMS claim pending on it, are stale.
+
+        "" when nothing is latched or a start may still be running. Text for the log
+        only; never contains an idTag. The PLC is read only for a latch older than
+        REMOTE_START_LATCH_TIMEOUT_SECONDS."""
+        cid = int(connector_id)
+        if cid not in (1, 2) or not getattr(self, "_dual_ready", False):
+            return ""
+        if cid in self._dual_aborting or cid in self._dual_local_claims:
+            return ""
+        if self._active_transaction_id(cid) > 0 or self._remote_stop_worker_running(cid):
+            return ""
+        if self._session_finishing_active(cid) or self._local_status_session_active(cid):
+            return ""
+        if int(getattr(self, f"myremotestart_c{cid}", 0) or 0) == 1:
+            return ""                                   # the PLC start pulse is still to come
+        for name in (f"rfid_start_received_c{cid}", f"rfid_recovery_pending_c{cid}"):
+            if int(getattr(self, name, 0) or 0) == 1:
+                return ""                               # a card start owns the head
+        if self._valid_id_tag(getattr(self, f"accepted_tag{cid}", "0")):
+            return ""
+        received = int(getattr(self, f"remote_start_received_c{cid}", 0) or 0) == 1
+        pulsed = int(getattr(self, f"start_transaction_SW{cid}", 0) or 0) == 3
+        if pulsed and not received:
+            # remote_start_received is cleared only when the session ends (cable out,
+            # StopTransaction, abort); nothing can use this pulse any more.
+            return "start_transaction_SW%s=3 left after its RemoteStart session ended" % cid
+        if received and not pulsed:
+            # set together with myremotestart (still 1 until the pulse) - this one lost it
+            return "remote_start_received_c%s=1 without a PLC start pulse" % cid
+        if received:
+            age = self._remote_start_latch_age(cid)
+            if age is None or age < REMOTE_START_LATCH_TIMEOUT_SECONDS:
+                return ""                               # the EV may still be starting
+            try:
+                state, _ = plc.get_connector_status(str(cid))
+            except Exception:
+                return ""
+            if state not in ("Available", "Preparing"):
+                return ""                               # an EV session is running: keep it
+            return ("RemoteStart sent to the PLC %d s ago and no StartTransaction (PLC %s)"
+                    % (age, state))
+        manager = getattr(self, "_dual_manager", None)
+        claim_age = manager.reserved_age(cid) if hasattr(manager, "reserved_age") else None
+        if claim_age is not None and claim_age >= REMOTE_START_LATCH_TIMEOUT_SECONDS:
+            return "CSMS claim pending %d s without a start" % claim_age
+        return ""
+
+    def _clear_remote_start_latch(self, connector_id, reason, release_claim=True):
+        """Release a RemoteStart that ended before StartTransaction: myremotestart_cN,
+        remote_start_received_cN, start_transaction_SWN=3 and, with release_claim, the
+        pending CSMS claim in the dual-CSMS router. Never touches a head with an open
+        transaction. Logs and returns True when something was released."""
+        cid = int(connector_id)
+        if cid not in (1, 2) or self._active_transaction_id(cid) > 0:
+            return False
+        released = []
+        for name, latched, idle in ((f"myremotestart_c{cid}", 1, 0),
+                                    (f"remote_start_received_c{cid}", 1, 0),
+                                    (f"start_transaction_SW{cid}", 3, 1)):
+            if int(getattr(self, name, idle) or 0) == latched:
+                setattr(self, name, idle)
+                _write_file(name + ".txt", idle)
+                released.append("%s=%s" % (name, latched))
+        setattr(self, f"_remote_start_latch_mono_c{cid}", None)
+        manager = getattr(self, "_dual_manager", None)
+        if release_claim and manager is not None and manager.release_pending(cid):
+            released.append("CSMS claim")
+        if released:
+            logging.warning("[START-LATCH] C%s released %s: %s", cid, ", ".join(released), reason)
+        return bool(released)
+
+    def _heal_stale_start_latch(self, connector_id):
+        """Release stale RemoteStart flags on this head instead of refusing the next start.
+
+        Called before a start is admitted: by the dual-CSMS router before its claim check
+        and by _dual_busy_reason() for RemoteStart and card starts. A pending CSMS claim
+        younger than REMOTE_START_LATCH_TIMEOUT_SECONDS is kept: it may belong to a start
+        being admitted right now. Returns the reason when something was released."""
+        try:
+            cid = int(connector_id)
+            reason = self._stale_start_latch_reason(cid)
+            if not reason:
+                return ""
+            manager = getattr(self, "_dual_manager", None)
+            claim_age = manager.reserved_age(cid) if hasattr(manager, "reserved_age") else None
+            old_claim = claim_age is not None and claim_age >= REMOTE_START_LATCH_TIMEOUT_SECONDS
+            if self._clear_remote_start_latch(cid, "stale, " + reason, release_claim=old_claim):
+                return reason
+        except Exception as error:
+            logging.warning("[START-LATCH] C%s stale start check failed (%s)",
+                            connector_id, type(error).__name__)
         return ""
 
     async def _dual_rfid_command_start(self, connector_id, id_tag):
@@ -4300,6 +4438,7 @@ class ChargePoint(OCPPProtocolMixin, cp):
             self._pin_autocharge_start_intent_c1 = ""
             self.myid_tag_c1 = id_tag
             self.remote_start_received_c1 = 1
+            self._remote_start_latch_mono_c1 = time.monotonic()   # [START-LATCH] latch age
             self.rfid_start_received_c1 = 0
             self.rfid_recovery_pending_c1 = 0
             self.block_sw3_C1 = 1
@@ -4316,6 +4455,7 @@ class ChargePoint(OCPPProtocolMixin, cp):
             self._pin_autocharge_start_intent_c2 = ""
             self.myid_tag_c2 = id_tag
             self.remote_start_received_c2 = 1
+            self._remote_start_latch_mono_c2 = time.monotonic()   # [START-LATCH] latch age
             self.rfid_start_received_c2 = 0
             self.rfid_recovery_pending_c2 = 0
             self.block_sw3 = 1
@@ -4851,6 +4991,10 @@ class ChargePoint(OCPPProtocolMixin, cp):
             _write_file("remote_start_received_c2.txt", 0)
             _write_file("rfid_start_received_c2.txt", 0)
             _write_file("active_id_tag_c2.txt", "Default")
+        # [START-LATCH] R3.1.6: also before the awaits, for the same reason. A pending pulse
+        # belongs to the start being aborted; start_transaction_SWN=3 left here refused every
+        # later start. The CSMS claim is released below, after the orphan stop, as before.
+        self._clear_remote_start_latch(int(connector_id), "start aborted", release_claim=False)
 
         ip_addr = self.myip_adr_c1 if connector_id == 1 else self.myip_adr_c2
         await async_remote_stop_plc(ip_addr, 1)
@@ -5504,6 +5648,7 @@ class ChargePoint(OCPPProtocolMixin, cp):
                     self.start_transaction_SW1 = 3
                     self.myremotestart_c1 = 0
                     self.start_trans_SW_c1 = 2
+                    self._remote_start_latch_mono_c1 = time.monotonic()   # [START-LATCH]
                     _write_file("start_transaction_SW1.txt", 3)
                     _write_file("myremotestart_c1.txt", 0)
                     _write_file("start_trans_SW_c1.txt", 2)
@@ -5524,6 +5669,7 @@ class ChargePoint(OCPPProtocolMixin, cp):
                     self.start_transaction_SW2 = 3
                     self.myremotestart_c2 = 0
                     self.start_trans_SW_c2 = 2
+                    self._remote_start_latch_mono_c2 = time.monotonic()   # [START-LATCH]
                     _write_file("start_transaction_SW2.txt", 3)
                     _write_file("myremotestart_c2.txt", 0)
                     _write_file("start_trans_SW_c2.txt", 2)
@@ -5703,6 +5849,9 @@ class ChargePoint(OCPPProtocolMixin, cp):
             await self.status_notification_with_status(1, 'Available')
             self.remote_start_received_c1 = 0              # [REMOTE-ONLY] session ใหม่ต้องมี RemoteStart ใหม่
             _write_file("remote_start_received_c1.txt", 0)
+            # [START-LATCH] R3.1.6: with it the rest of a RemoteStart that never reached
+            # StartTransaction - a start_transaction_SW1=3 left here refused every later start
+            self._clear_remote_start_latch(1, "cable removed before StartTransaction")
             # [LOCAL-STATUS-V16] ถอดสาย = จบ session แน่นอน ต้องกดจากหน้าจอใหม่
             self._set_local_status_session(1, 0)
             clear_local_request("start", 1)
@@ -5892,6 +6041,9 @@ class ChargePoint(OCPPProtocolMixin, cp):
             await self.status_notification_with_status(2, 'Available')
             self.remote_start_received_c2 = 0              # [REMOTE-ONLY] session ใหม่ต้องมี RemoteStart ใหม่
             _write_file("remote_start_received_c2.txt", 0)
+            # [START-LATCH] R3.1.6: with it the rest of a RemoteStart that never reached
+            # StartTransaction - a start_transaction_SW2=3 left here refused every later start
+            self._clear_remote_start_latch(2, "cable removed before StartTransaction")
             # [LOCAL-STATUS-V16] ถอดสาย = จบ session แน่นอน ต้องกดจากหน้าจอใหม่
             self._set_local_status_session(2, 0)
             clear_local_request("start", 2)
@@ -6140,6 +6292,19 @@ class ChargePoint(OCPPProtocolMixin, cp):
                 _write_file("active_id_tag_c1.txt", "Default")
                 self.block_sw1_C1 = 1
                 _write_file("block_sw1_C1.txt", 1)
+            elif (self.remote_start_received_c1 == 1 and self.block_sw2_C1 == 0):
+                # [START-LATCH] R3.1.6: the card branch above, for a RemoteStart. The
+                # session ended before StartTransaction (on 2026-11-10 the EV sent
+                # SessionStop 18 s after the start pulse). Without this branch nothing
+                # was sent and start_transaction_SW1=3 refused every later start.
+                logging.info(
+                    "[START-LATCH] C1 RemoteStart session ended before StartTransaction; "
+                    "sending Finishing without StopTransaction"
+                )
+                await self.status_notification_usiLink(1)
+                self._clear_remote_start_latch(1, "session ended before StartTransaction")
+                self.block_sw1_C1 = 1
+                _write_file("block_sw1_C1.txt", 1)
             elif self._local_status_session_active(1):
                 # [LOCAL-STATUS-V16] session จากหน้าจอจบลง — ไม่มี transaction ให้ปิด
                 # จึงแจ้ง Finishing อย่างเดียว  ปกติ topic/RemoteStop1 จะมาถึงก่อน
@@ -6206,6 +6371,19 @@ class ChargePoint(OCPPProtocolMixin, cp):
                 self.active_id_tag_c2 = "Default"
                 _write_file("rfid_start_received_c2.txt", 0)
                 _write_file("active_id_tag_c2.txt", "Default")
+                self.block_sw1 = 1
+                _write_file("block_sw1.txt", 1)
+            elif (self.remote_start_received_c2 == 1 and self.block_sw2 == 0):
+                # [START-LATCH] R3.1.6: the card branch above, for a RemoteStart. The
+                # session ended before StartTransaction (on 2026-11-10 the EV sent
+                # SessionStop 18 s after the start pulse). Without this branch nothing
+                # was sent and start_transaction_SW2=3 refused every later start.
+                logging.info(
+                    "[START-LATCH] C2 RemoteStart session ended before StartTransaction; "
+                    "sending Finishing without StopTransaction"
+                )
+                await self.status_notification_usiLink(2)
+                self._clear_remote_start_latch(2, "session ended before StartTransaction")
                 self.block_sw1 = 1
                 _write_file("block_sw1.txt", 1)
             elif self._local_status_session_active(2):
@@ -6951,6 +7129,10 @@ async def main():
                     f"start_sendMeterValue_SW{head}.txt": "1",
                     f"rfid_start_received_c{head}.txt": "0",
                     f"local_status_session_c{head}.txt": "0",   # [LOCAL-STATUS-V16]
+                    # [START-LATCH] R3.1.6: a RemoteStart from before the restart has no
+                    # session and no CSMS claim left (both checked by the caller)
+                    f"myremotestart_c{head}.txt": "0",
+                    f"remote_start_received_c{head}.txt": "0",
                     f"active_id_tag_c{head}.txt": "Default",
                     f"emergency_sent_c{head}.txt": "1",
                     f"emergency_sent_Sw_c{head}.txt": "1",
@@ -6981,6 +7163,7 @@ async def main():
                 cp_cls.my_remote_stop_c1 = 0
                 cp_cls.remote_stop_finishing_c1 = 0
                 cp_cls.rfid_start_received_c1 = 0
+                cp_cls.myremotestart_c1 = cp_cls.remote_start_received_c1 = 0   # [START-LATCH]
                 cp_cls.local_status_session_c1 = 0        # [LOCAL-STATUS-V16]
                 cp_cls.session_finishing_c1 = 0
                 cp_cls.active_id_tag_c1 = "Default"
@@ -6996,6 +7179,7 @@ async def main():
                 cp_cls.my_remote_stop_c2 = 0
                 cp_cls.remote_stop_finishing_c2 = 0
                 cp_cls.rfid_start_received_c2 = 0
+                cp_cls.myremotestart_c2 = cp_cls.remote_start_received_c2 = 0   # [START-LATCH]
                 cp_cls.local_status_session_c2 = 0        # [LOCAL-STATUS-V16]
                 cp_cls.session_finishing_c2 = 0
                 cp_cls.active_id_tag_c2 = "Default"

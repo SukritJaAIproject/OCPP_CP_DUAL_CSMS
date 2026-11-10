@@ -6,7 +6,7 @@
 
 [![OCPP 1.6J](https://img.shields.io/badge/OCPP-1.6J-2a78d6)](#message-routing)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776ab?logo=python&logoColor=white)](#requirements)
-[![Tests: 526 passing](https://img.shields.io/badge/tests-526%20passing-0ca30c)](#run-the-tests)
+[![Tests: 585 passing](https://img.shields.io/badge/tests-585%20passing-0ca30c)](#run-the-tests)
 [![License: MIT](https://img.shields.io/badge/license-MIT-6e7781)](LICENSE)
 
 </div>
@@ -52,7 +52,7 @@ The code runs on a 120 kW, two-connector DC charger in factory testing, connecte
 - **Smart charging.** The station rating is split between the connectors that are charging. `ChargePointMaxProfile` (CP Max) caps the whole station. Limits are always lowered before they are raised.
 - **Survives outages.** Messages for an unreachable CSMS wait in SQLite and are delivered in order when it reconnects. Sessions and ownership survive a restart.
 - **Simulator without hardware.** `live_dual_simulator.py` runs the full protocol stack against real CSMS using test charger IDs.
-- **526 offline tests** cover routing, ownership, smart charging, restarts and the `CP.py` hooks. They use only `127.0.0.1`.
+- **585 offline tests** cover routing, ownership, smart charging, restarts and the `CP.py` hooks. They use only `127.0.0.1`.
 
 ## How it works
 
@@ -252,7 +252,7 @@ helpf/
 dual_csms_config.json         which CSMS to connect to (placeholders)
 ocpp_services_config.json     station rating, transfer rules
 live_dual_simulator.py        protocol simulator without hardware
-tests/                        526 offline tests
+tests/                        585 offline tests
 tools/                        protocol harness, CSMS API client, simulator controls
 deploy/edgebox_r31.sh         Edgebox install helper
 docs/images/                  diagrams in this README
@@ -277,6 +277,7 @@ CHANGES_*.patch               diff between consecutive releases
 | R3.1.3 | `admin_csms` can list several CSMS, so B can send the admin commands too |
 | R3.1.4 | Cards are checked with CSMS A first, then CSMS B. The session belongs to the CSMS that accepted the card |
 | R3.1.5 | Status `info` names the CSMS that owns each session, for both CSMS |
+| R3.1.6 | A RemoteStart that ends before StartTransaction releases its start latch, so later starts on that connector are no longer refused. A latch left behind is released by the next start request |
 
 Detailed notes for each release (in Thai) are in `R31x_CHANGES_TH.md`. The exact diff between releases is in `CHANGES_<from>_TO_<to>.patch`.
 

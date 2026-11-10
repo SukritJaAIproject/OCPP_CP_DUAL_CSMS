@@ -507,6 +507,15 @@ class DualCSMSManager:
         self.db.commit()
         return self.db.execute("SELECT * FROM sessions WHERE local_id=?", (cursor.lastrowid,)).fetchone()
 
+    def reserved_age(self, connector):
+        """[R3.1.6] Seconds since the pending (reserved) claim on this connector was made;
+        None when it has none. The charger releases a claim older than its RemoteStart
+        timeout that no start owns any more (CP.py _heal_stale_start_latch)."""
+        row = self._live(connector)
+        if row is None or row["state"] != "reserved":
+            return None
+        return max(0.0, time.time() - float(row["created"]))
+
     def release_pending(self, connector):
         row = self._live(connector)
         if row and row["state"] == "reserved":
@@ -1036,6 +1045,15 @@ class DualCSMSManager:
                 return self._refuse_start(server, connector, "invalid connector")
             if not getattr(self.core, "_dual_ready", False):
                 return self._refuse_start(server, connector, "charger startup not finished")
+            # [R3.1.6] Flags or a claim left by a RemoteStart that ended before
+            # StartTransaction are released by the charger before the claim check.
+            heal = getattr(self.core, "_heal_stale_start_latch", None)
+            if heal is not None:
+                try:
+                    heal(connector)
+                except Exception as error:
+                    LOG.warning("[%s] RemoteStart C%s: stale start check failed (%s)",
+                                server, connector, type(error).__name__)
             live = self._live(connector)
             if live is not None:
                 return self._refuse_start(server, connector, "already claimed by %s session %s (%s)"

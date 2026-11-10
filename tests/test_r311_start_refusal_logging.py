@@ -3,9 +3,15 @@
 Found on the factory Edgebox on 2026-11-09: a RemoteStart from A was answered
 Rejected and nothing in the log said why. These checks pin the reason texts, that
 no idTag is logged, and that CP.py's guard keeps R3.1's conditions and order.
+
+R3.1.6: a lone remote_start_received_c1=1 or start_transaction_SW1=3 left by a RemoteStart
+that ended before StartTransaction is released by the guard (test_r316_start_latch.py), so
+the two reasons below are pinned with the flags of a start that may still be running.
 """
 import ast
 import logging
+import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -99,7 +105,10 @@ def test_runtime_start_refusal_texts(fake, expected):
 def cp_guard(plc_state="Preparing", local_request=0.0):
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ChargePoint")
-    names = ("_dual_connector_busy", "_dual_busy_reason", "_valid_id_tag")
+    names = ("_dual_connector_busy", "_dual_busy_reason", "_valid_id_tag",
+             # R3.1.6: the guard releases a stale RemoteStart latch first
+             "_heal_stale_start_latch", "_stale_start_latch_reason", "_clear_remote_start_latch",
+             "_remote_start_latch_age")
     nodes = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names)
     calls = []
@@ -117,10 +126,13 @@ def cp_guard(plc_state="Preparing", local_request=0.0):
     module = ast.fix_missing_locations(ast.Module(body=[ast.ClassDef(
         name="Core", bases=[], keywords=[], body=nodes, decorator_list=[])], type_ignores=[]))
     env = {"take_local_request": take_local_request, "staticmethod": staticmethod,
-           "plc": SimpleNamespace(get_connector_status=get_connector_status)}
+           "plc": SimpleNamespace(get_connector_status=get_connector_status),
+           "time": time, "os": os, "logging": logging, "_write_file": lambda name, value: None,
+           "REMOTE_START_LATCH_TIMEOUT_SECONDS": 180.0}
     exec(compile(module, str(SOURCE), "exec"), env)
     core = env["Core"]()
     core._dual_ready = True
+    core._dual_manager = None
     core._dual_aborting, core._dual_local_claims = set(), set()
     core._protocol_runtime = SimpleNamespace(faulted=set(), smart=SimpleNamespace(inhibited=False, last_error=None),
                                              services=SimpleNamespace(_operative=lambda cid: True))
@@ -145,8 +157,12 @@ def cp_guard(plc_state="Preparing", local_request=0.0):
     (lambda c: setattr(c, "stop_worker", True), "remote stop still running"),
     (lambda c: setattr(c, "finishing", True), "previous session finishing - unplug the cable first"),
     (lambda c: setattr(c, "local_session", True), "session started from the charger screen"),
-    (lambda c: setattr(c, "remote_start_received_c1", 1), "remote_start_received_c1=1"),
-    (lambda c: setattr(c, "start_transaction_SW1", 3), "start already sent to the PLC (start_transaction_SW1=3)"),
+    # R3.1.6: a RemoteStart pulsed just now may still start - it keeps the head
+    (lambda c: (setattr(c, "remote_start_received_c1", 1), setattr(c, "start_transaction_SW1", 3),
+                setattr(c, "_remote_start_latch_mono_c1", time.monotonic())), "remote_start_received_c1=1"),
+    # R3.1.6: a lone SW1=3 is released; with a card waiting it is not, and keeps its reason
+    (lambda c: (setattr(c, "start_transaction_SW1", 3), setattr(c, "accepted_tag1", "CARD")),
+     "start already sent to the PLC (start_transaction_SW1=3)"),
     (lambda c: setattr(c, "accepted_tag1", "CARD"), "an accepted RFID tag is waiting for its start"),
     (lambda c: c._protocol_runtime.faulted.add(1), "connector faulted after a PLC limit failure"),
 ])
