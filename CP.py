@@ -4310,13 +4310,18 @@ class ChargePoint(OCPPProtocolMixin, cp):
                 connector_id,
             )
             return
+        # [R3.1.8] Faulted with errorCode NoError says "no fault" to a CSMS that reads only
+        # errorCode (seen on 2026-11-10: the cause was in info alone). OCPP 1.6 has no error
+        # code for an emergency stop, so this is OtherError plus the vendorErrorCode the
+        # Vector fault path already uses for the same button.
         await self.call(call.StatusNotification(
             connector_id=connector_id,
-            error_code='NoError',
+            error_code='OtherError',
             status='Faulted',
             info='EmergencyButtonPressed',
             timestamp=convert_timeformat(datetime.now(timezone.utc).replace(tzinfo=timezone.utc)),
             vendor_id='EgatDimomdService',
+            vendor_error_code=EMERGENCY_STOP_FAULT_CODE or 'SYS_EMERGENCY_STOP',
         ))
         self._remember_reported_status(connector_id, 'Faulted')
 

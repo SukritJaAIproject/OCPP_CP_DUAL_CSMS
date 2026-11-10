@@ -1,0 +1,90 @@
+"""R3.1.8: the emergency button is reported as Faulted with a real error code.
+
+Found on Edgebox 192.168.3.15 on 2026-11-10 (16:11:34, 16:12:03 and 16:38:42): the charger sent
+status Faulted with errorCode NoError for connectors 0, 1 and 2; the cause was only in info
+(EmergencyButtonPressed). OCPP 1.6 uses NoError for "no fault", so a CSMS that reads errorCode
+alone could not see the emergency. It is now OtherError with a vendorErrorCode, the same code the
+Vector fault path uses for this button.
+"""
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from ocpp.v16 import call
+from ocpp.v16.enums import ChargePointErrorCode, ChargePointStatus
+
+from test_r316_start_latch import cp_class
+
+CODE = "SYS_EMERGENCY_STOP"
+
+
+def emergency_core(bridge_active=False, bridge_enabled=True, code=CODE):
+    core = cp_class(
+        ("status_notification_emer",), call=call, datetime=datetime, timezone=timezone,
+        convert_timeformat=lambda moment: "2026-11-10T09:38:42.512Z",
+        VECTOR_FAULT_BRIDGE_ENABLED=bridge_enabled, VECTOR_FAULT_STATUS_MAX_AGE_SECONDS=120.0,
+        EMERGENCY_STOP_FAULT_CODE=code)()
+    core.order = []
+    core.call = AsyncMock(side_effect=lambda request: core.order.append(("status", request)))
+    core._emergency_stop_open_transactions = AsyncMock(
+        side_effect=lambda: core.order.append(("stop-transactions", None)))
+    core.reported = []
+    core._remember_reported_status = lambda cid, status: core.reported.append((cid, status))
+    core.vector_fault_bridge = SimpleNamespace(has_active=lambda cid: bridge_active,
+                                               source_recent=lambda age: bridge_active)
+    return core
+
+
+def sent(core):
+    return [request for kind, request in core.order if kind == "status"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("connector", [0, 1, 2])
+async def test_emergency_is_faulted_with_other_error_and_a_vendor_code(connector):
+    core = emergency_core()
+    await core.status_notification_emer(connector)
+
+    (request,) = sent(core)
+    assert request.connector_id == connector
+    assert request.status == ChargePointStatus.faulted
+    assert request.error_code == ChargePointErrorCode.other_error
+    assert request.error_code != ChargePointErrorCode.no_error
+    assert request.vendor_error_code == CODE
+    assert request.info == "EmergencyButtonPressed"
+    assert request.vendor_id == "EgatDimomdService"
+    assert core.reported == [(connector, "Faulted")]
+
+
+@pytest.mark.asyncio
+async def test_the_status_is_sent_once_per_call_and_after_the_transactions_are_closed():
+    core = emergency_core()
+    await core.status_notification_emer(0)
+    await core.status_notification_emer(1)
+    await core.status_notification_emer(2)
+
+    assert [kind for kind, _ in core.order] == ["stop-transactions", "status", "status", "status"]
+    assert [request.connector_id for request in sent(core)] == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_configured_code_falls_back_to_the_default():
+    core = emergency_core(code="")
+    await core.status_notification_emer(1)
+    assert sent(core)[0].vendor_error_code == "SYS_EMERGENCY_STOP"
+
+
+@pytest.mark.asyncio
+async def test_a_live_vector_fault_collector_still_reports_instead():
+    core = emergency_core(bridge_active=True)
+    await core.status_notification_emer(0)
+    await core.status_notification_emer(1)
+
+    assert sent(core) == [] and core.reported == []
+    assert [kind for kind, _ in core.order] == ["stop-transactions"]   # the transactions still close first
+
+
+def test_other_error_is_an_ocpp_16_error_code_and_the_vendor_code_fits():
+    assert "OtherError" in {code.value for code in ChargePointErrorCode}
+    assert len(CODE) <= 50 and len("EmergencyButtonPressed") <= 50   # CiString50
