@@ -1979,7 +1979,15 @@ class ChargePoint(OCPPProtocolMixin, cp):
         return ""
 
     async def _dual_rfid_command_start(self, connector_id, id_tag):
-        """Run MQTT RFID arbitration on the same loop as the OCPP handlers."""
+        """Run MQTT RFID arbitration on the same loop as the OCPP handlers.
+
+        [CARD-START] R3.1.7. On 2026-11-10 (Edgebox 192.168.3.15) a card was accepted by its
+        CSMS twice and nothing started: 3-12 s after plug-in the EV was already in CP state C
+        (CableCheck), which the PLC reports as SuspendedEV, and this path only started from
+        Available or Preparing - silently. It now starts from the same waiting states as
+        RemoteStart (R3.1.2), does nothing while no vehicle is connected (the PLC kept such a
+        start pulse as a charging permission for 5 minutes with no session behind it), and
+        logs why an accepted card did not start. The log never contains the idTag."""
         cid = int(connector_id)
         manager = self._dual_manager
         if manager is None or not self.allow_rfid_command_start or not self._valid_id_tag(id_tag):
@@ -1987,9 +1995,29 @@ class ChargePoint(OCPPProtocolMixin, cp):
         gate = getattr(self, "_ocpp_start_allowed", None)
         # [R3.1.4] the CSMS that last accepted this tag (local_csms when unknown)
         if gate is not None and not await gate(cid, manager.local_owner_for(id_tag), id_tag):
+            explain = getattr(self, "_ocpp_start_refusal", None)
+            try:
+                reason = explain(cid) if explain else "start not allowed"
+            except Exception as error:
+                reason = "start not allowed (%s)" % type(error).__name__
+            logging.warning("[CARD-START] C%s card not started: %s", cid, reason)
             return False
-        if self._dual_connector_busy(cid) or not manager.claim_local(cid, id_tag):
-            logging.warning("[DUAL] RFID start rejected: connector %s is busy", cid)
+        if self._dual_connector_busy(cid):
+            logging.warning("[CARD-START] C%s card not started: %s", cid,
+                            self._dual_busy_reason(cid) or "connector busy")
+            return False
+        try:
+            plugged, _ = plc.get_connector_status(str(cid))
+        except Exception as error:
+            logging.warning("[CARD-START] C%s card not started: PLC state unreadable (%s)",
+                            cid, type(error).__name__)
+            return False
+        if plugged == "Available":
+            logging.warning("[CARD-START] C%s card not started: no vehicle connected - "
+                            "plug in, then tap the card", cid)
+            return False
+        if not manager.claim_local(cid, id_tag):
+            logging.warning("[CARD-START] C%s card not started: connector claimed by another start", cid)
             return False
         self._dual_local_claims.add(cid)
         armed = False
@@ -1997,10 +2025,17 @@ class ChargePoint(OCPPProtocolMixin, cp):
             result = await self.authorize(id_tag)
             info = result.id_tag_info
             if (info.get("status") if isinstance(info, dict) else getattr(info, "status", None)) != "Accepted":
+                logging.info("[CARD-START] C%s card not started: not accepted by a CSMS", cid)
                 return False
             # Claim was held across Authorize; no remote start can overtake it.
             state, _ = plc.get_connector_status(str(cid))
-            if state not in ("Available", "Preparing") or self._active_transaction_id(cid) > 0:
+            # [R3.1.7] SuspendedEV/SuspendedEVSE without a transaction is an EV waiting for
+            # authorisation (see _dual_busy_reason); Available means the cable left meanwhile.
+            if state not in ("Preparing", "SuspendedEV", "SuspendedEVSE"):
+                logging.warning("[CARD-START] C%s card accepted but not started: PLC reports %s", cid, state)
+                return False
+            if self._active_transaction_id(cid) > 0:
+                logging.warning("[CARD-START] C%s card accepted but not started: a transaction is open", cid)
                 return False
             self._clear_stale_stop_latch_for_new_start(cid, "RFIDCommand")
             for name, value in ((f"myid_tag_c{cid}", id_tag), (f"myid_tag_ath_c{cid}", id_tag),
@@ -2009,6 +2044,7 @@ class ChargePoint(OCPPProtocolMixin, cp):
                 setattr(self, name, value)
                 _write_file(name + ".txt", value)
             armed = True
+            logging.info("[CARD-START] C%s card accepted, start sent to the PLC (PLC %s)", cid, state)
             await async_remote_start_plc(str(cid), 1)
             try:
                 await asyncio.sleep(3)

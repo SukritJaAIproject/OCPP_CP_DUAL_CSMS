@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# edgebox_r31.sh - install helper for OCPP dual-CSMS R3.1.6 on the Edgebox (Raspberry Pi with CP.py)
+# edgebox_r31.sh - install helper for OCPP dual-CSMS R3.1.7 on the Edgebox (Raspberry Pi with CP.py)
 #
 #   bash ~/edgebox_r31.sh check                      read-only report, changes nothing
 #   bash ~/edgebox_r31.sh stage                      unpack + verify + offline tests in ~/r31_stage
@@ -30,11 +30,13 @@ umask 022
 #          to both CSMS, so either side's log says whose session a head is running
 # R3.1.6 = R3.1.5 + a RemoteStart that ends before StartTransaction releases its start latch and
 #          claim; a latch left behind is released by the next start instead of refusing it
-PKG_NAME=OCPP_CP_DUAL_CSMS_R316_CANDIDATE_2026-11-10.zip
-PKG_SHA=1a8d71b798f2e3de1d3eb2f93e4d5f444694d2815e95e40d420c09214c753d4e
+# R3.1.7 = R3.1.6 + an accepted card starts while the EV waits in SuspendedEV; a card tapped with no
+#          vehicle connected does nothing; every card that does not start is logged with its reason
+PKG_NAME=OCPP_CP_DUAL_CSMS_R317_CANDIDATE_2026-11-10.zip
+PKG_SHA=e3850ba7e4d0fb9416958d804a80e296133810f6e255ae4b9d729faebaef94cd
 HERE=$(cd "$(dirname "$0")" && pwd)
 STAGE="$HOME/r31_stage"
-PKG_DIR="$STAGE/OCPP_CP_DUAL_CSMS_R316"
+PKG_DIR="$STAGE/OCPP_CP_DUAL_CSMS_R317"
 FILES="CP.py helpf/plc_function.py helpf/v2g_datatransfer.py helpf/dual_csms.py dual_csms_config.json dual_csms_check.py helpf/ocpp_services.py helpf/ocpp_smart_charging.py helpf/ocpp_runtime.py ocpp_services_config.json"
 
 die() { echo "STOP: $*"; exit 1; }
@@ -50,14 +52,15 @@ known() {
     CP.py:9340bdfa36846e26c9d77cab0b70b0859755b3a2bf6bc735615a6fe06444f209) echo "R3.1.2/R3.1.3" ;;
     CP.py:a73e7720828814c4e7ac89e14f8a9bee72e9b0424f3aa6e3cab2da9f2876016f) echo "R3.1.4/R3.1.5" ;;
     CP.py:ae16ac09a3a95ae7288a7612f9f0b5ae228c65056eebc06394c36a5d5a58c571) echo "R3.1.6" ;;
+    CP.py:af4a536e66ba42cb1a84410238c2f7ca9ea8bfcd58d1b1133d45c0dc67b29848) echo "R3.1.7" ;;
     # The Edgebox's own CP.py found on 2026-11-09 (file time 10:44). On 2026-11-09 the user chose
     # to replace it with R3.1 without merging; install backs up the whole folder first.
     CP.py:9e925f117b15*) echo "Edgebox version of 2026-11-09 (user approved replacing it)" ;;
     helpf/plc_function.py:0b4f062526e6ec3fb444b28d61e7276e23192c29b6f6af0d1b295f158331c803) echo "original (R3.1 built on this)" ;;
     helpf/plc_function.py:86d17d214adc81641e0efee7a670c0c1514e46d8f8cf09de6e35677f92bcc215) echo "R1/R2" ;;
-    helpf/plc_function.py:46dea5393fcaa711cdeff9b9487c43c4028e2ac3d762a049b5208b311cc29bb9) echo "R3-R3.1.6" ;;
+    helpf/plc_function.py:46dea5393fcaa711cdeff9b9487c43c4028e2ac3d762a049b5208b311cc29bb9) echo "R3-R3.1.7" ;;
     helpf/v2g_datatransfer.py:1e02b6ea7d83233bedbed485dac32a024b42115cad4079dcf5a7b8ddb1ffb43e) echo "original (R3.1 built on this)" ;;
-    helpf/v2g_datatransfer.py:502ecdeaf6c60962fcf310bd7717d32e74e732745224edba36dd17bd4a43fd8c) echo "R1-R3.1.6" ;;
+    helpf/v2g_datatransfer.py:502ecdeaf6c60962fcf310bd7717d32e74e732745224edba36dd17bd4a43fd8c) echo "R1-R3.1.7" ;;
     *) echo "UNKNOWN" ;;
   esac
 }
@@ -169,6 +172,7 @@ known_body() {
     e75749cb3732d57af400b753f37629204a982897272a7ec869cd316e98402283) echo "R3.1.2/R3.1.3" ;;
     aa47dea952d1c259eea5873c540aecb576fe6b991494cc38d790255173e7e01c) echo "R3.1.4/R3.1.5" ;;
     2a20f8a7dc86c3c5f1d82feea06f01eba8c64e58b1e1b530bcdc63b657edd889) echo "R3.1.6" ;;
+    1ddd89f54ba6e8634cfa9968dc4925d8515f34fbaf73691ea20dd0f2fca67327) echo "R3.1.7" ;;
     *) echo "UNKNOWN" ;;
   esac
 }
@@ -275,7 +279,7 @@ PY
 
 check() {
   PY=$(service_python)
-  echo "=== R3.1.6 CHECK (read-only)  $(date '+%F %T')  $(hostname)"
+  echo "=== R3.1.7 CHECK (read-only)  $(date '+%F %T')  $(hostname)"
   echo "python: $PY  ($("$PY" --version 2>&1))"
   UNIT=${UNIT:-$(units | head -1)}; SVC_USER=$(svc_user)
   echo "packages as $(id -un): $(pkg_versions "$PY")"
@@ -335,7 +339,7 @@ check() {
 
 stage() {
   PY=${PYTHON:-$(service_python)}
-  echo "=== R3.1.6 STAGE  $(date '+%F %T')  (the running charger program is not touched)"
+  echo "=== R3.1.7 STAGE  $(date '+%F %T')  (the running charger program is not touched)"
   [ -f "$HERE/$PKG_NAME" ] || die "upload $PKG_NAME next to this script first"
   [ "$(sha "$HERE/$PKG_NAME")" = "$PKG_SHA" ] || die "package SHA256 mismatch, upload again"
   echo "python: $PY  ($("$PY" --version 2>&1))"
@@ -356,7 +360,7 @@ stage() {
 run_tests() { # staged offline tests as $SVC_USER (the user the charger service runs as); marks a pass
   local rc
   echo "  packages as $SVC_USER (the user of ${UNIT:-the service}): $(pkg_versions as_svc "$PY")"
-  echo "  running 585 offline tests as $SVC_USER (about 1-2 minutes, uses only 127.0.0.1)..."
+  echo "  running 595 offline tests as $SVC_USER (about 1-2 minutes, uses only 127.0.0.1)..."
   ( cd "$PKG_DIR" && as_svc env PYTHONPATH="$STAGE/.testlibs" PYTHONDONTWRITEBYTECODE=1 timeout 1800 "$PY" -m pytest tests -q \
       --tb=line -p no:cacheprovider > "$STAGE/pytest.log" 2>&1 ); rc=$?
   tail -12 "$STAGE/pytest.log"
@@ -389,7 +393,7 @@ install_r31() {
   [ "$RATED_A" -ge 10 ] && [ "$RATED_A" -le 1000 ] || die "RATED_A=$RATED_A looks wrong (amperes per head)"
   PY=${PYTHON:-$(service_python)}
   [ -f "$PKG_DIR/MANIFEST_SHA256.json" ] || die "run: bash $0 stage   first"
-  echo "=== R3.1.6 INSTALL into $CP_DIR  $(date '+%F %T')"
+  echo "=== R3.1.7 INSTALL into $CP_DIR  $(date '+%F %T')"
   # The user decided on 2026-11-09 that this factory test Edgebox may have any version replaced:
   # unknown versions are reported, not refused. The full folder backup below keeps them.
   for f in CP.py helpf/plc_function.py helpf/v2g_datatransfer.py; do
@@ -565,9 +569,9 @@ PY
   for f in A B; do
     echo "    CSMS $f: $(grep -E "\[$f\] (OCPP registration|BootNotification|connection unavailable)" "$L" 2>/dev/null | tail -1 | sed -E 's/^[0-9-]+ ([0-9:]+),[0-9]+ - [A-Za-z_]+ - [A-Z]+ - /\1 /' | cut -c1-100)   last reply at: $(grep -E " - $f: receive message \[3," "$L" 2>/dev/null | tail -1 | cut -c12-19)"
   done
-  echo "  card checks at the charger (last 6, no idTag):"
-  grep -E '\[(A|B)\] Authorize |\[DUAL\] local start on connector' "$L" 2>/dev/null | grep -v -i idtag \
-    | sed -E 's/^[0-9-]+ ([0-9:]+),[0-9]+ - [A-Za-z_]+ - [A-Z]+ - /\1 /' | cut -c1-110 | tail -6 | sed 's/^/    /'
+  echo "  card checks at the charger (last 10, no idTag):"
+  grep -a -E '\[(A|B)\] Authorize |\[DUAL\] local start on connector|\[CARD-START\]' "$L" 2>/dev/null | grep -v -i idtag \
+    | sed -E 's/^[0-9-]+ ([0-9:]+),[0-9]+ - [A-Za-z_]+ - [A-Z]+ - /\1 /' | cut -c1-130 | tail -10 | sed 's/^/    /'
   echo "  session owners in the statuses sent to both CSMS (last 4, from this log):"
   grep -oE 'A: send .*"StatusNotification",\{"connectorId":[12],.*"info":"Session of CSMS [^"]*"' "$L" 2>/dev/null \
     | sed -E 's/^A: send \[2,"[^"]*","StatusNotification",\{"connectorId":([12]),.*"status":"([A-Za-z]+)".*"info":"([^"]*)".*/    C\1 \2: \3/' | tail -4
@@ -585,7 +589,7 @@ PY
   f=$(grep -a -E 'RemoteStart C[0-9]+ rejected:|\[REMOTE-START[^]]*\] reject' "$L" 2>/dev/null | grep -v -i idtag | cut -c1-200 | tail -6)
   if [ -n "$f" ]; then echo "$f" | sed 's/^/    /'; else echo "    none in this log"; fi
   echo "  refusals, latches and faults (last 15, unmapped Vector lines left out):"
-  grep -E 'rejected:|\[REMOTE-START|\[START-LATCH|\[SESSION-FINISHING|\[PREPARING-TIMEOUT|\[VECTOR-FAULT|\[EV-STOP|"status":"(Faulted|Finishing|Preparing|Charging)"' "$L" 2>/dev/null \
+  grep -E 'rejected:|\[REMOTE-START|\[START-LATCH|\[CARD-START|\[SESSION-FINISHING|\[PREPARING-TIMEOUT|\[VECTOR-FAULT|\[EV-STOP|"status":"(Faulted|Finishing|Preparing|Charging)"' "$L" 2>/dev/null \
     | grep -v -e idTag -e 'unmapped/non-sendable issue ignored' | cut -c1-170 | tail -15 | sed 's/^/    /'
   echo "=== END DIAG (nothing was changed)"
 }

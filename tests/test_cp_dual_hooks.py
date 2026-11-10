@@ -105,6 +105,7 @@ async def test_mqtt_rfid_claim_is_held_during_authorization_and_pulses_once():
     core._valid_id_tag = lambda tag: bool(tag)
     core._dual_local_claims = set()
     core._dual_connector_busy = lambda cid: cid in core._dual_local_claims
+    core._dual_busy_reason = lambda cid: "local RFID start in progress"   # R3.1.7 logs the reason
     core._active_transaction_id = lambda cid: 0
     core.authorize = authorize
     core._clear_stale_stop_latch_for_new_start = lambda *args: None
